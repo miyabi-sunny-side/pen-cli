@@ -149,6 +149,11 @@ impl Herdr {
         Ok(())
     }
 
+    fn notify(&self, title: &str) -> Result<()> {
+        let _: Value = self.call("notification.show", &json!({ "title": title }))?;
+        Ok(())
+    }
+
     fn focus(&self, workspace_id: &str) -> Result<()> {
         let _: Value = self.call("workspace.focus", &json!({ "workspace_id": workspace_id }))?;
         Ok(())
@@ -210,6 +215,11 @@ fn save_current(herdr: &Herdr, config: &Path) -> Result<()> {
             root,
         },
     )?;
+    // 保存は完了している。toast は通知でしかないので失敗しても save を汚さない
+    if let Err(error) = herdr.notify(&format!("セッション {} を保存しました", workspace.label))
+    {
+        eprintln!("pen: notification failed: {error}");
+    }
     println!("saved {}", workspace.label);
     Ok(())
 }

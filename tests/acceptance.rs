@@ -92,6 +92,7 @@ fn save_persists_the_current_workspace_layout_as_toml() {
             reply(
                 r#"{"type":"layout_export","layout":{"workspace_id":"w7","tab_id":"w7:t1","zoomed":false,"focused_pane_id":"w7:p1","root":{"type":"split","direction":"right","ratio":0.6,"first":{"type":"pane","pane_id":"w7:p1","cwd":"/work","command":["codex"],"env":{"MODE":"dev"},"label":"agent"},"second":{"type":"pane","pane_id":"w7:p2","cwd":"/work/docs","command":["zsh"]}}}}"#,
             ),
+            reply(r#"{"type":"notification_show"}"#),
         ],
     );
 
@@ -115,8 +116,74 @@ fn save_persists_the_current_workspace_layout_as_toml() {
         .iter()
         .map(|request| request["method"].as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(methods, ["pane.current", "workspace.list", "layout.export"]);
+    assert_eq!(
+        methods,
+        [
+            "pane.current",
+            "workspace.list",
+            "layout.export",
+            "notification.show"
+        ]
+    );
     assert_eq!(requests.lock().unwrap()[2]["params"]["tab_id"], "w7:t1");
+    assert_eq!(
+        requests.lock().unwrap()[3]["params"]["title"],
+        "セッション demo/project を保存しました"
+    );
+}
+
+#[test]
+fn save_succeeds_and_warns_when_the_toast_cannot_be_shown() {
+    let temp = TempDir::new("save-toast-failure");
+    let socket = temp.0.join("herdr.sock");
+    let (requests, server) = mock_herdr(
+        &socket,
+        vec![
+            reply(
+                r#"{"type":"pane_current","pane":{"pane_id":"w7:p1","workspace_id":"w7","tab_id":"w7:t1"}}"#,
+            ),
+            reply(
+                r#"{"type":"workspace_list","workspaces":[{"workspace_id":"w7","active_tab_id":"w7:t1","label":"demo/project","focused":true}]}"#,
+            ),
+            reply(
+                r#"{"type":"layout_export","layout":{"workspace_id":"w7","tab_id":"w7:t1","zoomed":false,"focused_pane_id":"w7:p1","root":{"type":"pane","pane_id":"w7:p1","cwd":"/work"}}}"#,
+            ),
+            r#"{"id":"test","error":{"message":"notifications unavailable"}}"#.to_owned(),
+        ],
+    );
+
+    let output = pen(&temp, &socket).arg("save").output().unwrap();
+    server.join().unwrap();
+
+    // 保存データの成否と補助通知の成否は分離する: toast 失敗でも save は成功
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let saved = fs::read_to_string(temp.0.join("config/demo_project.toml")).unwrap();
+    assert!(saved.contains("label = \"demo/project\""));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("pen: notification failed:")
+            && stderr.contains("notifications unavailable"),
+        "stderr should warn about the failed toast: {stderr}"
+    );
+    let methods: Vec<_> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|request| request["method"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        methods,
+        [
+            "pane.current",
+            "workspace.list",
+            "layout.export",
+            "notification.show"
+        ]
+    );
 }
 
 #[test]
