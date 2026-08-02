@@ -266,3 +266,19 @@ fn picker_space_restores_a_saved_workspace() {
     assert_eq!(seen[1]["params"]["tab_label"], "sleeping");
     assert_eq!(seen[1]["params"]["root"]["command"][0], "claude");
 }
+
+#[test]
+fn version_flag_reports_the_cargo_package_version() {
+    for flag in ["--version", "-V", "version"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pen"))
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{flag}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("pen {}\n", env!("CARGO_PKG_VERSION")),
+            "{flag}"
+        );
+    }
+}

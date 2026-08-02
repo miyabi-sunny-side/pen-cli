@@ -72,8 +72,9 @@ fn repository_has_the_v0_1_0_rust_cli_foundation() {
     let readme = fs::read_to_string("README.md").unwrap();
     let (ci, _) = workflow(".github/workflows/ci.yml");
 
+    let version_line = format!("version = \"{}\"", env!("CARGO_PKG_VERSION"));
     for required in [
-        "version = \"0.1.0\"",
+        version_line.as_str(),
         "rust-version = \"1.96\"",
         "license = \"MIT\"",
         "[lints.clippy]",

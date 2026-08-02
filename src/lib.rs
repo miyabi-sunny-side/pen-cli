@@ -11,8 +11,8 @@ use std::process::{Command, Stdio};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const HELP: &str =
-    "pen — suspend and restore herdr workspaces\n\nUsage:\n  pen save\n  pen close\n  pen picker\n";
+const HELP: &str = "pen — suspend and restore herdr workspaces\n\nUsage:\n  pen save\n  pen close\n  pen picker\n  pen --version\n";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Definition {
@@ -192,6 +192,10 @@ where
         Some("save") => save_current(&Herdr::from_env()?, &config_dir()?),
         Some("close") => close_current(&Herdr::from_env()?, &config_dir()?),
         Some("picker") => picker(&Herdr::from_env()?, &config_dir()?),
+        Some("version" | "--version" | "-V") => {
+            println!("pen {VERSION}");
+            Ok(())
+        }
         Some("help" | "--help" | "-h") | None => {
             print!("{HELP}");
             Ok(())
