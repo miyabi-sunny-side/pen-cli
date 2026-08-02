@@ -10,19 +10,30 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            artifact: pen-linux-x86_64.tar.gz
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: pen-macos-aarch64.tar.gz
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - uses: dtolnay/rust-toolchain@191af2e1955bbe165f9bbacff2d2438002dff4d4 # 1.96.0
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          key: x86_64-unknown-linux-musl
+          key: ${{ matrix.target }}
 
       - name: Install musl toolchain
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Verify tag matches Cargo version
@@ -36,22 +47,26 @@ jobs:
         run: cargo test --locked
 
       - name: Build release binary
-        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+        run: cargo build --release --locked --target "${{ matrix.target }}"
 
       - name: Package artifact
         shell: bash
         run: |
-          cp target/x86_64-unknown-linux-musl/release/pen pen
-          tar -czf pen-linux-x86_64.tar.gz pen LICENSE
-          sha256sum pen-linux-x86_64.tar.gz > pen-linux-x86_64.tar.gz.sha256
+          cp "target/${{ matrix.target }}/release/pen" pen
+          tar -czf "${{ matrix.artifact }}" pen LICENSE
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
+          else
+            sha256sum "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
+          fi
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: pen-linux-x86_64.tar.gz
+          name: ${{ matrix.artifact }}
           path: |
-            pen-linux-x86_64.tar.gz
-            pen-linux-x86_64.tar.gz.sha256
+            ${{ matrix.artifact }}
+            ${{ matrix.artifact }}.sha256
 
   release:
     if: startsWith(github.ref, 'refs/tags/')

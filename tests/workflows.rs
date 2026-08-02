@@ -14,7 +14,10 @@ fn a_version_tag_builds_and_publishes_the_pen_release_assets() {
     for required in [
         "tags:\n      - \"v*\"",
         "x86_64-unknown-linux-musl",
+        "aarch64-apple-darwin",
+        "macos-latest",
         "pen-linux-x86_64.tar.gz",
+        "pen-macos-aarch64.tar.gz",
         "Verify tag matches Cargo version",
         "cargo test --locked",
         "cargo build --release --locked --target",
@@ -27,7 +30,6 @@ fn a_version_tag_builds_and_publishes_the_pen_release_assets() {
             "release workflow is missing {required}"
         );
     }
-    assert!(!source.contains("aarch64-apple-darwin"));
     assert!(!source.contains("workflow_dispatch"));
 }
 
@@ -86,11 +88,14 @@ fn repository_has_the_v0_1_0_rust_cli_foundation() {
     assert!(license.starts_with("MIT License\n"));
     for required in [
         "Linux x86_64",
+        "macOS Apple Silicon",
+        "Intel Macs are not supported",
         "herdr",
         "fzf",
         "PEN_CONFIG_DIR",
         "PEN_SOCKET",
         "PEN_FZF",
+        "xattr -d com.apple.quarantine pen",
     ] {
         assert!(readme.contains(required), "README is missing {required}");
     }
