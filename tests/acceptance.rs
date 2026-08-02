@@ -11,12 +11,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 struct TempDir(PathBuf);
 
 impl TempDir {
-    fn new(name: &str) -> Self {
+    fn new(_name: &str) -> Self {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("pen-{name}-{}-{stamp}", std::process::id()));
+        // macOS limits Unix socket paths to 104 bytes. Its temp_dir() can
+        // already be long, so keep the test socket rooted at short /tmp.
+        let path = PathBuf::from("/tmp").join(format!("p{}-{stamp}", std::process::id()));
         fs::create_dir_all(&path).unwrap();
         Self(path)
     }
