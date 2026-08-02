@@ -4,23 +4,28 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
+
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(_name: &str) -> Self {
-        let stamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        // macOS limits Unix socket paths to 104 bytes. Its temp_dir() can
-        // already be long, so keep the test socket rooted at short /tmp.
-        let path = PathBuf::from("/tmp").join(format!("p{}-{stamp}", std::process::id()));
-        fs::create_dir_all(&path).unwrap();
-        Self(path)
+        loop {
+            let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+            // macOS limits Unix socket paths to 104 bytes. Its temp_dir() can
+            // already be long, so keep the test socket rooted at short /tmp.
+            let path = PathBuf::from("/tmp").join(format!("p{}-{id}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!("cannot create test directory {}: {error}", path.display()),
+            }
+        }
     }
 }
 
@@ -28,6 +33,34 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
     }
+}
+
+#[test]
+fn parallel_test_sockets_are_unique_and_short_enough_for_macos() {
+    const COUNT: usize = 64;
+    let barrier = Arc::new(Barrier::new(COUNT));
+    let handles = (0..COUNT)
+        .map(|_| {
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let temp = TempDir::new("parallel");
+                let socket = temp.0.join("herdr.sock");
+                let listener = UnixListener::bind(&socket).unwrap();
+                (temp, socket, listener)
+            })
+        })
+        .collect::<Vec<_>>();
+    let sockets = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+
+    let mut paths = sockets.iter().map(|(_, path, _)| path).collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    assert_eq!(paths.len(), COUNT);
+    assert!(paths.iter().all(|path| path.as_os_str().len() < 104));
 }
 
 fn reply(result: &str) -> String {
