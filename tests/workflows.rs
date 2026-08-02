@@ -34,6 +34,14 @@ fn a_version_tag_builds_and_publishes_the_pen_release_assets() {
 }
 
 #[test]
+fn ci_runs_for_main_pull_requests_but_not_pushes() {
+    let (source, _) = workflow(".github/workflows/ci.yml");
+
+    assert!(source.contains("on:\n  pull_request:\n    branches:\n      - main"));
+    assert!(!source.contains("\n  push:"));
+}
+
+#[test]
 fn workflows_are_valid_pinned_and_minimally_privileged() {
     for path in [
         Path::new(".github/workflows/ci.yml"),
