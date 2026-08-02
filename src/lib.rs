@@ -43,7 +43,8 @@ enum LayoutNode {
 
 #[derive(Clone, Debug, Deserialize)]
 struct Workspace {
-    workspace_id: String,
+    #[serde(rename = "workspace_id")]
+    id: String,
     active_tab_id: String,
     label: String,
 }
@@ -94,7 +95,7 @@ impl Herdr {
         Ok(Self { socket })
     }
 
-    fn call<T: DeserializeOwned>(&self, method: &str, params: Value) -> Result<T> {
+    fn call<T: DeserializeOwned>(&self, method: &str, params: &Value) -> Result<T> {
         let mut stream = UnixStream::connect(&self.socket).map_err(|error| {
             format!(
                 "cannot connect to herdr at {}: {error}",
@@ -126,37 +127,37 @@ impl Herdr {
 
     fn current_pane(&self) -> Result<PaneInfo> {
         Ok(self
-            .call::<PaneCurrentResult>("pane.current", json!({}))?
+            .call::<PaneCurrentResult>("pane.current", &json!({}))?
             .pane)
     }
 
     fn workspaces(&self) -> Result<Vec<Workspace>> {
         Ok(self
-            .call::<WorkspaceListResult>("workspace.list", json!({}))?
+            .call::<WorkspaceListResult>("workspace.list", &json!({}))?
             .workspaces)
     }
 
     fn export_tab(&self, tab_id: &str) -> Result<LayoutNode> {
         Ok(self
-            .call::<LayoutExportResult>("layout.export", json!({ "tab_id": tab_id }))?
+            .call::<LayoutExportResult>("layout.export", &json!({ "tab_id": tab_id }))?
             .layout
             .root)
     }
 
     fn close(&self, workspace_id: &str) -> Result<()> {
-        let _: Value = self.call("workspace.close", json!({ "workspace_id": workspace_id }))?;
+        let _: Value = self.call("workspace.close", &json!({ "workspace_id": workspace_id }))?;
         Ok(())
     }
 
     fn focus(&self, workspace_id: &str) -> Result<()> {
-        let _: Value = self.call("workspace.focus", json!({ "workspace_id": workspace_id }))?;
+        let _: Value = self.call("workspace.focus", &json!({ "workspace_id": workspace_id }))?;
         Ok(())
     }
 
     fn apply(&self, definition: &Definition) -> Result<()> {
         let _: Value = self.call(
             "layout.apply",
-            json!({
+            &json!({
                 "root": definition.root,
                 "tab_label": definition.label,
                 "focus": true,
@@ -166,6 +167,12 @@ impl Herdr {
     }
 }
 
+/// Runs the requested `pen` subcommand.
+///
+/// # Errors
+///
+/// Returns an error when arguments are invalid, herdr cannot be reached, or
+/// workspace definitions cannot be read or written.
 pub fn run<I>(args: I) -> Result<()>
 where
     I: IntoIterator<Item = String>,
@@ -193,7 +200,7 @@ fn save_current(herdr: &Herdr, config: &Path) -> Result<()> {
     let workspaces = herdr.workspaces()?;
     let workspace = workspaces
         .iter()
-        .find(|workspace| workspace.workspace_id == pane.workspace_id)
+        .find(|workspace| workspace.id == pane.workspace_id)
         .ok_or_else(|| format!("current workspace {} was not found", pane.workspace_id))?;
     let root = herdr.export_tab(&workspace.active_tab_id)?;
     save_definition(
@@ -212,11 +219,11 @@ fn close_current(herdr: &Herdr, config: &Path) -> Result<()> {
     let workspaces = herdr.workspaces()?;
     let workspace = workspaces
         .iter()
-        .find(|workspace| workspace.workspace_id == pane.workspace_id)
+        .find(|workspace| workspace.id == pane.workspace_id)
         .ok_or_else(|| format!("current workspace {} was not found", pane.workspace_id))?;
 
     ensure_saved(herdr, config, workspace)?;
-    herdr.close(&workspace.workspace_id)?;
+    herdr.close(&workspace.id)?;
     println!("closed {}", workspace.label);
     Ok(())
 }
@@ -295,10 +302,10 @@ fn picker(herdr: &Herdr, config: &Path) -> Result<()> {
     match (key, active) {
         ("space", Some(workspace)) => {
             ensure_saved(herdr, config, workspace)?;
-            herdr.close(&workspace.workspace_id)?;
+            herdr.close(&workspace.id)?;
             println!("closed {label}");
         }
-        ("space", None) | ("enter", None) => {
+        ("space" | "enter", None) => {
             let definition = definitions
                 .get(label)
                 .ok_or_else(|| format!("saved definition not found: {label}"))?;
@@ -306,7 +313,7 @@ fn picker(herdr: &Herdr, config: &Path) -> Result<()> {
             println!("restored {label}");
         }
         ("enter", Some(workspace)) => {
-            herdr.focus(&workspace.workspace_id)?;
+            herdr.focus(&workspace.id)?;
         }
         _ => {}
     }
