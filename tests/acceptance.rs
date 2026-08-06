@@ -107,14 +107,18 @@ fn pen(temp: &TempDir, socket: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_pen"));
     command
         .env("PEN_CONFIG_DIR", temp.0.join("config"))
-        .env("PEN_SOCKET", socket);
+        .env("PEN_SOCKET", socket)
+        // 開発環境の herdr pane から test が走っても結果が変わらないよう固定する
+        .env("HERDR_PANE_ID", "w7:p1");
     command
 }
 
 #[test]
-fn save_persists_the_current_workspace_layout_as_toml() {
+fn save_persists_every_tab_with_foreground_commands_as_toml() {
     let temp = TempDir::new("save");
     let socket = temp.0.join("herdr.sock");
+    // 実 herdr (protocol 17) の意味論: layout.export は実行中コマンドを返さない。
+    // 前景コマンドは pane.process_info で pane ごとに捕捉する。
     let (requests, server) = mock_herdr(
         &socket,
         vec![
@@ -125,7 +129,22 @@ fn save_persists_the_current_workspace_layout_as_toml() {
                 r#"{"type":"workspace_list","workspaces":[{"workspace_id":"w7","active_tab_id":"w7:t1","label":"demo/project","focused":true}]}"#,
             ),
             reply(
-                r#"{"type":"layout_export","layout":{"workspace_id":"w7","tab_id":"w7:t1","zoomed":false,"focused_pane_id":"w7:p1","root":{"type":"split","direction":"right","ratio":0.6,"first":{"type":"pane","pane_id":"w7:p1","cwd":"/work","command":["codex"],"env":{"MODE":"dev"},"label":"agent"},"second":{"type":"pane","pane_id":"w7:p2","cwd":"/work/docs","command":["zsh"]}}}}"#,
+                r#"{"type":"tab_list","tabs":[{"tab_id":"w7:t1","workspace_id":"w7","number":1,"label":"agent","focused":true,"pane_count":2,"agent_status":"working"},{"tab_id":"w7:t2","workspace_id":"w7","number":2,"label":"docs","focused":false,"pane_count":1,"agent_status":"unknown"}]}"#,
+            ),
+            reply(
+                r#"{"type":"layout_export","layout":{"workspace_id":"w7","tab_id":"w7:t1","zoomed":false,"focused_pane_id":"w7:p1","root":{"type":"split","direction":"right","ratio":0.6,"first":{"type":"pane","pane_id":"w7:p1","cwd":"/work","env":{"MODE":"dev"},"label":"agent"},"second":{"type":"pane","pane_id":"w7:p2","cwd":"/work/docs"}}}}"#,
+            ),
+            reply(
+                r#"{"type":"pane_process_info","process_info":{"pane_id":"w7:p1","shell_pid":100,"foreground_process_group_id":200,"foreground_processes":[{"pid":200,"name":"claude","argv":["claude"],"cmdline":"claude","cwd":"/work"},{"pid":201,"name":"uv","argv":["uv","tool"],"cmdline":"uv tool","cwd":"/work"}]}}"#,
+            ),
+            reply(
+                r#"{"type":"pane_process_info","process_info":{"pane_id":"w7:p2","shell_pid":300,"foreground_process_group_id":300,"foreground_processes":[{"pid":300,"name":"zsh","argv":["/usr/bin/zsh"],"cmdline":"/usr/bin/zsh","cwd":"/work/docs"}]}}"#,
+            ),
+            reply(
+                r#"{"type":"layout_export","layout":{"workspace_id":"w7","tab_id":"w7:t2","zoomed":false,"focused_pane_id":"w7:p3","root":{"type":"pane","pane_id":"w7:p3","cwd":"/work"}}}"#,
+            ),
+            reply(
+                r#"{"type":"pane_process_info","process_info":{"pane_id":"w7:p3","shell_pid":400,"foreground_process_group_id":500,"foreground_processes":[{"pid":500,"name":"codex","argv":["codex"],"cmdline":"codex","cwd":"/work"}]}}"#,
             ),
             reply(r#"{"type":"notification_show"}"#),
         ],
@@ -141,8 +160,14 @@ fn save_persists_the_current_workspace_layout_as_toml() {
     );
     let saved = fs::read_to_string(temp.0.join("config/demo_project.toml")).unwrap();
     assert!(saved.contains("label = \"demo/project\""));
+    assert_eq!(saved.matches("[[tabs]]").count(), 2);
+    assert!(saved.contains("label = \"agent\""));
+    assert!(saved.contains("label = \"docs\""));
     assert!(saved.contains("direction = \"right\""));
+    // 前景コマンドが pane に載る。素の shell (w7:p2) には command を書かない
+    assert!(saved.contains("command = [\"claude\"]"));
     assert!(saved.contains("command = [\"codex\"]"));
+    assert_eq!(saved.matches("command = ").count(), 2);
     assert!(saved.contains("MODE = \"dev\""));
     assert!(!saved.contains("pane_id"));
     let methods: Vec<_> = requests
@@ -156,13 +181,26 @@ fn save_persists_the_current_workspace_layout_as_toml() {
         [
             "pane.current",
             "workspace.list",
+            "tab.list",
             "layout.export",
+            "pane.process_info",
+            "pane.process_info",
+            "layout.export",
+            "pane.process_info",
             "notification.show"
         ]
     );
-    assert_eq!(requests.lock().unwrap()[2]["params"]["tab_id"], "w7:t1");
+    let seen = requests.lock().unwrap();
+    // focus がどこにあっても呼び出し元の workspace を保存する
+    assert_eq!(seen[0]["params"]["caller_pane_id"], "w7:p1");
+    assert_eq!(seen[2]["params"]["workspace_id"], "w7");
+    assert_eq!(seen[3]["params"]["tab_id"], "w7:t1");
+    assert_eq!(seen[4]["params"]["pane_id"], "w7:p1");
+    assert_eq!(seen[5]["params"]["pane_id"], "w7:p2");
+    assert_eq!(seen[6]["params"]["tab_id"], "w7:t2");
+    assert_eq!(seen[7]["params"]["pane_id"], "w7:p3");
     assert_eq!(
-        requests.lock().unwrap()[3]["params"]["title"],
+        seen[8]["params"]["title"],
         "セッション demo/project を保存しました"
     );
 }
@@ -181,7 +219,13 @@ fn save_succeeds_and_warns_when_the_toast_cannot_be_shown() {
                 r#"{"type":"workspace_list","workspaces":[{"workspace_id":"w7","active_tab_id":"w7:t1","label":"demo/project","focused":true}]}"#,
             ),
             reply(
+                r#"{"type":"tab_list","tabs":[{"tab_id":"w7:t1","workspace_id":"w7","number":1,"label":"1","focused":true,"pane_count":1,"agent_status":"unknown"}]}"#,
+            ),
+            reply(
                 r#"{"type":"layout_export","layout":{"workspace_id":"w7","tab_id":"w7:t1","zoomed":false,"focused_pane_id":"w7:p1","root":{"type":"pane","pane_id":"w7:p1","cwd":"/work"}}}"#,
+            ),
+            reply(
+                r#"{"type":"pane_process_info","process_info":{"pane_id":"w7:p1","shell_pid":100,"foreground_process_group_id":100,"foreground_processes":[{"pid":100,"name":"zsh","argv":["/usr/bin/zsh"],"cmdline":"/usr/bin/zsh","cwd":"/work"}]}}"#,
             ),
             r#"{"id":"test","error":{"message":"notifications unavailable"}}"#.to_owned(),
         ],
@@ -215,7 +259,9 @@ fn save_succeeds_and_warns_when_the_toast_cannot_be_shown() {
         [
             "pane.current",
             "workspace.list",
+            "tab.list",
             "layout.export",
+            "pane.process_info",
             "notification.show"
         ]
     );
@@ -260,10 +306,11 @@ fn close_keeps_the_saved_definition_and_closes_the_current_workspace() {
 }
 
 #[test]
-fn picker_space_restores_a_saved_workspace() {
+fn picker_space_restores_a_legacy_single_root_definition() {
     let temp = TempDir::new("picker");
     let config = temp.0.join("config");
     fs::create_dir_all(&config).unwrap();
+    // v0.1.x の旧形式 (単一 [root]) も 1 tab の workspace として復元できること
     fs::write(
         config.join("sleeping.toml"),
         "label = \"sleeping\"\n\n[root]\ntype = \"pane\"\ncwd = \"/sleeping\"\ncommand = [\"claude\"]\n",
@@ -285,6 +332,8 @@ fn picker_space_restores_a_saved_workspace() {
             reply(
                 r#"{"type":"layout_apply","layout":{"workspace_id":"w9","tab_id":"w9:t2","zoomed":false,"focused_pane_id":"w9:p2","root":{"type":"pane","pane_id":"w9:p2","cwd":"/sleeping","command":["claude"]}}}"#,
             ),
+            reply(r#"{"type":"tab_focus"}"#),
+            reply(r#"{"type":"workspace_focus"}"#),
         ],
     );
 
@@ -307,18 +356,109 @@ fn picker_space_restores_a_saved_workspace() {
         .collect();
     assert_eq!(
         methods,
-        ["workspace.list", "workspace.create", "layout.apply"]
+        [
+            "workspace.list",
+            "workspace.create",
+            "layout.apply",
+            "tab.focus",
+            "workspace.focus"
+        ]
     );
-    // 復元先 workspace の作成。focus は layout 完成後に apply 側で移す
     assert_eq!(seen[1]["params"]["label"], "sleeping");
     assert_eq!(seen[1]["params"]["focus"], false);
     // workspace.create が作った初期 tab を置換する。tab_id と workspace_id の
     // 併用は herdr が invalid_target で拒否するので tab_id 単独でなければならない
     assert_eq!(seen[2]["params"]["tab_id"], "w9:t1");
     assert!(seen[2]["params"].get("workspace_id").is_none());
-    assert_eq!(seen[2]["params"]["focus"], true);
-    assert_eq!(seen[2]["params"]["tab_label"], "sleeping");
+    assert_eq!(seen[2]["params"]["focus"], false);
     assert_eq!(seen[2]["params"]["root"]["command"][0], "claude");
+    // focus は全 tab が揃ってから: 置換後の tab_id → workspace の順
+    assert_eq!(seen[3]["params"]["tab_id"], "w9:t2");
+    assert_eq!(seen[4]["params"]["workspace_id"], "w9");
+}
+
+#[test]
+fn picker_enter_restores_every_tab_of_a_multi_tab_definition() {
+    let temp = TempDir::new("picker-tabs");
+    let config = temp.0.join("config");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(
+        config.join("agents.toml"),
+        concat!(
+            "label = \"agents\"\n\n",
+            "[[tabs]]\nlabel = \"agent\"\n\n",
+            "[tabs.root]\ntype = \"pane\"\ncwd = \"/work\"\ncommand = [\"claude\"]\n\n",
+            "[[tabs]]\nlabel = \"docs\"\n\n",
+            "[tabs.root]\ntype = \"pane\"\ncwd = \"/work/docs\"\ncommand = [\"codex\"]\n",
+        ),
+    )
+    .unwrap();
+    let fake_fzf = temp.0.join("fzf");
+    fs::write(&fake_fzf, "#!/bin/sh\nprintf 'enter\\n○\\tagents\\n'\n").unwrap();
+    fs::set_permissions(&fake_fzf, fs::Permissions::from_mode(0o755)).unwrap();
+    let socket = temp.0.join("herdr.sock");
+    let (requests, server) = mock_herdr(
+        &socket,
+        vec![
+            reply(r#"{"type":"workspace_list","workspaces":[]}"#),
+            reply(
+                r#"{"type":"workspace_created","workspace":{"workspace_id":"w9","number":9,"label":"agents","focused":false,"pane_count":1,"tab_count":1,"active_tab_id":"w9:t1","agent_status":"unknown"},"tab":{"tab_id":"w9:t1","workspace_id":"w9","number":1,"label":"1","focused":false,"pane_count":1,"agent_status":"unknown"},"root_pane":{"pane_id":"w9:p1","workspace_id":"w9","tab_id":"w9:t1"}}"#,
+            ),
+            reply(
+                r#"{"type":"layout_apply","layout":{"workspace_id":"w9","tab_id":"w9:t2","zoomed":false,"focused_pane_id":"w9:p2","root":{"type":"pane","pane_id":"w9:p2","cwd":"/work","command":["claude"]}}}"#,
+            ),
+            reply(
+                r#"{"type":"layout_apply","layout":{"workspace_id":"w9","tab_id":"w9:t3","zoomed":false,"focused_pane_id":"w9:p3","root":{"type":"pane","pane_id":"w9:p3","cwd":"/work/docs","command":["codex"]}}}"#,
+            ),
+            reply(r#"{"type":"tab_focus"}"#),
+            reply(r#"{"type":"workspace_focus"}"#),
+        ],
+    );
+
+    let output = pen(&temp, &socket)
+        .env("PEN_FZF", &fake_fzf)
+        .arg("picker")
+        .output()
+        .unwrap();
+    server.join().unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let seen = requests.lock().unwrap();
+    let methods: Vec<_> = seen
+        .iter()
+        .map(|request| request["method"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        methods,
+        [
+            "workspace.list",
+            "workspace.create",
+            "layout.apply",
+            "layout.apply",
+            "tab.focus",
+            "workspace.focus"
+        ]
+    );
+    // tab 1 は初期 tab の置換 (tab_id 単独)。兄弟がいる状態で置換すると末尾へ
+    // 動くため、置換 → append の順でだけ保存順が保たれる (herdr 0.7.5 実測)
+    assert_eq!(seen[2]["params"]["tab_id"], "w9:t1");
+    assert!(seen[2]["params"].get("workspace_id").is_none());
+    assert_eq!(seen[2]["params"]["tab_label"], "agent");
+    assert_eq!(seen[2]["params"]["focus"], false);
+    assert_eq!(seen[2]["params"]["root"]["command"][0], "claude");
+    // tab 2 以降は workspace_id 単独の append
+    assert_eq!(seen[3]["params"]["workspace_id"], "w9");
+    assert!(seen[3]["params"].get("tab_id").is_none());
+    assert_eq!(seen[3]["params"]["tab_label"], "docs");
+    assert_eq!(seen[3]["params"]["focus"], false);
+    assert_eq!(seen[3]["params"]["root"]["command"][0], "codex");
+    // 全 tab が揃ってから tab 1 (置換後の実 tab_id) を選び workspace を前面へ
+    assert_eq!(seen[4]["params"]["tab_id"], "w9:t2");
+    assert_eq!(seen[5]["params"]["workspace_id"], "w9");
 }
 
 #[test]

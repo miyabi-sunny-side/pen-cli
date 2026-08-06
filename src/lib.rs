@@ -17,7 +17,35 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct Definition {
     label: String,
+    tabs: Vec<TabDefinition>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct TabDefinition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
     root: LayoutNode,
+}
+
+/// 保存ファイルの直列化形。v0.1.x は単一 [root] だったので、既存ファイルは
+/// legacy として読み、1 tab の Definition へ正規化する。書き込みは常に新形式。
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredDefinition {
+    Tabs(Definition),
+    Legacy { label: String, root: LayoutNode },
+}
+
+impl From<StoredDefinition> for Definition {
+    fn from(stored: StoredDefinition) -> Self {
+        match stored {
+            StoredDefinition::Tabs(definition) => definition,
+            StoredDefinition::Legacy { label, root } => Self {
+                label,
+                tabs: vec![TabDefinition { label: None, root }],
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -32,6 +60,9 @@ enum LayoutNode {
         env: BTreeMap<String, String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
+        // layout.export が返す実 pane の参照。command 捕捉にだけ使い、保存はしない
+        #[serde(default, skip_serializing)]
+        pane_id: Option<String>,
     },
     Split {
         direction: String,
@@ -45,7 +76,6 @@ enum LayoutNode {
 struct Workspace {
     #[serde(rename = "workspace_id")]
     id: String,
-    active_tab_id: String,
     label: String,
 }
 
@@ -70,8 +100,53 @@ struct CreatedTab {
 }
 
 #[derive(Deserialize)]
+struct CreatedWorkspace {
+    workspace_id: String,
+}
+
+#[derive(Deserialize)]
 struct WorkspaceCreateResult {
+    workspace: CreatedWorkspace,
     tab: CreatedTab,
+}
+
+#[derive(Deserialize)]
+struct TabRow {
+    tab_id: String,
+    label: String,
+}
+
+#[derive(Deserialize)]
+struct TabListResult {
+    tabs: Vec<TabRow>,
+}
+
+#[derive(Deserialize)]
+struct ForegroundProcess {
+    pid: u64,
+    argv: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ProcessInfo {
+    shell_pid: u64,
+    foreground_process_group_id: u64,
+    foreground_processes: Vec<ForegroundProcess>,
+}
+
+#[derive(Deserialize)]
+struct ProcessInfoResult {
+    process_info: ProcessInfo,
+}
+
+#[derive(Deserialize)]
+struct AppliedLayout {
+    tab_id: String,
+}
+
+#[derive(Deserialize)]
+struct LayoutApplyResult {
+    layout: AppliedLayout,
 }
 
 #[derive(Deserialize)]
@@ -136,8 +211,15 @@ impl Herdr {
     }
 
     fn current_pane(&self) -> Result<PaneInfo> {
+        // pane.current は caller_pane_id がないと「focus 中の pane」に解決される。
+        // herdr が pane の shell に配る HERDR_PANE_ID を渡し、focus がどこに
+        // あっても呼び出し元自身の workspace を対象にする。
+        let params = match env::var("HERDR_PANE_ID") {
+            Ok(pane_id) => json!({ "caller_pane_id": pane_id }),
+            Err(_) => json!({}),
+        };
         Ok(self
-            .call::<PaneCurrentResult>("pane.current", &json!({}))?
+            .call::<PaneCurrentResult>("pane.current", &params)?
             .pane)
     }
 
@@ -152,6 +234,33 @@ impl Herdr {
             .call::<LayoutExportResult>("layout.export", &json!({ "tab_id": tab_id }))?
             .layout
             .root)
+    }
+
+    fn tabs(&self, workspace_id: &str) -> Result<Vec<TabRow>> {
+        Ok(self
+            .call::<TabListResult>("tab.list", &json!({ "workspace_id": workspace_id }))?
+            .tabs)
+    }
+
+    /// pane の前景コマンドを返す。前景 process group が shell 自身なら None
+    /// (素の shell は復元時にも素の shell でよい)。
+    fn pane_command(&self, pane_id: &str) -> Result<Option<Vec<String>>> {
+        let info = self
+            .call::<ProcessInfoResult>("pane.process_info", &json!({ "pane_id": pane_id }))?
+            .process_info;
+        if info.foreground_process_group_id == info.shell_pid {
+            return Ok(None);
+        }
+        Ok(info
+            .foreground_processes
+            .iter()
+            .find(|process| process.pid == info.foreground_process_group_id)
+            .map(|process| process.argv.clone()))
+    }
+
+    fn focus_tab(&self, tab_id: &str) -> Result<()> {
+        let _: Value = self.call("tab.focus", &json!({ "tab_id": tab_id }))?;
+        Ok(())
     }
 
     fn close(&self, workspace_id: &str) -> Result<()> {
@@ -170,30 +279,51 @@ impl Herdr {
     }
 
     fn restore(&self, definition: &Definition) -> Result<()> {
+        let Some((first, rest)) = definition.tabs.split_first() else {
+            return Err(format!("definition {:?} has no tabs", definition.label).into());
+        };
         // layout.apply は workspace を作らない (workspace 指定なしだと呼び出し元
         // workspace への新規 tab になる) ので、先に復元先 workspace を用意する。
-        // focus は layout 完成後に apply 側で移す。
         let created: WorkspaceCreateResult = self.call(
             "workspace.create",
             &json!({ "label": definition.label, "focus": false }),
         )?;
-        // tab_id と workspace_id の併用は herdr が invalid_target で拒否する。
-        // tab_id 単独指定で workspace.create が作った初期 tab の layout を置換する。
-        self.call::<Value>(
-            "layout.apply",
-            &json!({
-                "root": definition.root,
-                "tab_id": created.tab.tab_id,
-                "tab_label": definition.label,
-                "focus": true,
-            }),
-        )
-        .map_err(|error| {
+        let hint = |error: Box<dyn Error>| {
             format!(
-                "{error} (restore left an empty workspace {:?}; close it manually)",
+                "{error} (restore left an incomplete workspace {:?}; close it manually)",
                 definition.label
             )
-        })?;
+        };
+        // tab_id と workspace_id の併用は herdr が invalid_target で拒否する。
+        // 初期 tab の置換を最初に行う: 兄弟 tab がいる状態で置換するとその tab は
+        // 末尾へ移動するため、置換 → append の順でだけ保存順が保たれる (実測)。
+        let applied: LayoutApplyResult = self
+            .call(
+                "layout.apply",
+                &json!({
+                    "root": first.root,
+                    "tab_id": created.tab.tab_id,
+                    "tab_label": first.label,
+                    "focus": false,
+                }),
+            )
+            .map_err(hint)?;
+        for tab in rest {
+            let _: Value = self
+                .call(
+                    "layout.apply",
+                    &json!({
+                        "root": tab.root,
+                        "workspace_id": created.workspace.workspace_id,
+                        "tab_label": tab.label,
+                        "focus": false,
+                    }),
+                )
+                .map_err(hint)?;
+        }
+        // 全 tab が揃ってから tab 1 を選び、workspace ごと前面へ
+        self.focus_tab(&applied.layout.tab_id).map_err(hint)?;
+        self.focus(&created.workspace.workspace_id).map_err(hint)?;
         Ok(())
     }
 }
@@ -237,14 +367,7 @@ fn save_current(herdr: &Herdr, config: &Path) -> Result<()> {
         .iter()
         .find(|workspace| workspace.id == pane.workspace_id)
         .ok_or_else(|| format!("current workspace {} was not found", pane.workspace_id))?;
-    let root = herdr.export_tab(&workspace.active_tab_id)?;
-    save_definition(
-        config,
-        &Definition {
-            label: workspace.label.clone(),
-            root,
-        },
-    )?;
+    save_definition(config, &snapshot_definition(herdr, workspace)?)?;
     // 保存は完了している。toast は通知でしかないので失敗しても save を汚さない
     if let Err(error) = herdr.notify(&format!("セッション {} を保存しました", workspace.label))
     {
@@ -278,14 +401,48 @@ fn ensure_saved(herdr: &Herdr, config: &Path, workspace: &Workspace) -> Result<(
     ))? {
         return Err("close cancelled; workspace has no saved definition".into());
     }
-    let root = herdr.export_tab(&workspace.active_tab_id)?;
-    save_definition(
-        config,
-        &Definition {
-            label: workspace.label.clone(),
+    save_definition(config, &snapshot_definition(herdr, workspace)?)
+}
+
+/// workspace の全 tab を export し、pane ごとの前景コマンドを添えた定義を作る。
+fn snapshot_definition(herdr: &Herdr, workspace: &Workspace) -> Result<Definition> {
+    let mut tabs = Vec::new();
+    for tab in herdr.tabs(&workspace.id)? {
+        let mut root = herdr.export_tab(&tab.tab_id)?;
+        capture_commands(herdr, &mut root);
+        tabs.push(TabDefinition {
+            label: Some(tab.label),
             root,
-        },
-    )
+        });
+    }
+    if tabs.is_empty() {
+        return Err(format!("workspace {} has no tabs", workspace.label).into());
+    }
+    Ok(Definition {
+        label: workspace.label.clone(),
+        tabs,
+    })
+}
+
+/// `layout.export` は実行中コマンドを含まないので、`pane.process_info` で
+/// 前景コマンドを補う。取得失敗は警告に留め、layout だけでも保存する。
+fn capture_commands(herdr: &Herdr, node: &mut LayoutNode) {
+    match node {
+        LayoutNode::Pane {
+            command, pane_id, ..
+        } => {
+            let Some(pane_id) = pane_id else { return };
+            match herdr.pane_command(pane_id) {
+                Ok(Some(argv)) => *command = Some(argv),
+                Ok(None) => {}
+                Err(error) => eprintln!("pen: cannot inspect pane {pane_id}: {error}"),
+            }
+        }
+        LayoutNode::Split { first, second, .. } => {
+            capture_commands(herdr, first);
+            capture_commands(herdr, second);
+        }
+    }
 }
 
 fn picker(herdr: &Herdr, config: &Path) -> Result<()> {
@@ -381,8 +538,9 @@ fn load_definitions(config: &Path) -> Result<BTreeMap<String, Definition>> {
         if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
             continue;
         }
-        let definition: Definition = toml::from_str(&fs::read_to_string(&path)?)
+        let stored: StoredDefinition = toml::from_str(&fs::read_to_string(&path)?)
             .map_err(|error| format!("invalid definition {}: {error}", path.display()))?;
+        let definition = Definition::from(stored);
         definitions.insert(definition.label.clone(), definition);
     }
     Ok(definitions)
