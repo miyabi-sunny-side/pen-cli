@@ -65,6 +65,16 @@ struct WorkspaceListResult {
 }
 
 #[derive(Deserialize)]
+struct CreatedTab {
+    tab_id: String,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceCreateResult {
+    tab: CreatedTab,
+}
+
+#[derive(Deserialize)]
 struct LayoutExportResult {
     layout: ExportedLayout,
 }
@@ -159,15 +169,31 @@ impl Herdr {
         Ok(())
     }
 
-    fn apply(&self, definition: &Definition) -> Result<()> {
-        let _: Value = self.call(
+    fn restore(&self, definition: &Definition) -> Result<()> {
+        // layout.apply は workspace を作らない (workspace 指定なしだと呼び出し元
+        // workspace への新規 tab になる) ので、先に復元先 workspace を用意する。
+        // focus は layout 完成後に apply 側で移す。
+        let created: WorkspaceCreateResult = self.call(
+            "workspace.create",
+            &json!({ "label": definition.label, "focus": false }),
+        )?;
+        // tab_id と workspace_id の併用は herdr が invalid_target で拒否する。
+        // tab_id 単独指定で workspace.create が作った初期 tab の layout を置換する。
+        self.call::<Value>(
             "layout.apply",
             &json!({
                 "root": definition.root,
+                "tab_id": created.tab.tab_id,
                 "tab_label": definition.label,
                 "focus": true,
             }),
-        )?;
+        )
+        .map_err(|error| {
+            format!(
+                "{error} (restore left an empty workspace {:?}; close it manually)",
+                definition.label
+            )
+        })?;
         Ok(())
     }
 }
@@ -323,7 +349,7 @@ fn picker(herdr: &Herdr, config: &Path) -> Result<()> {
             let definition = definitions
                 .get(label)
                 .ok_or_else(|| format!("saved definition not found: {label}"))?;
-            herdr.apply(definition)?;
+            herdr.restore(definition)?;
             println!("restored {label}");
         }
         ("enter", Some(workspace)) => {

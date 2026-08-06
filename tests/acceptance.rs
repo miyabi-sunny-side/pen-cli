@@ -273,12 +273,17 @@ fn picker_space_restores_a_saved_workspace() {
     fs::write(&fake_fzf, "#!/bin/sh\nprintf 'space\\n○\\tsleeping\\n'\n").unwrap();
     fs::set_permissions(&fake_fzf, fs::Permissions::from_mode(0o755)).unwrap();
     let socket = temp.0.join("herdr.sock");
+    // 復元先 workspace は pen が workspace.create で作る。layout.apply 単発では
+    // 呼び出し元 workspace へ tab が刺さるだけ、が実 herdr (protocol 17) の意味論。
     let (requests, server) = mock_herdr(
         &socket,
         vec![
             reply(r#"{"type":"workspace_list","workspaces":[]}"#),
             reply(
-                r#"{"type":"layout_apply","layout":{"workspace_id":"w9","tab_id":"w9:t1","zoomed":false,"focused_pane_id":"w9:p1","root":{"type":"pane","pane_id":"w9:p1","cwd":"/sleeping","command":["claude"]}}}"#,
+                r#"{"type":"workspace_created","workspace":{"workspace_id":"w9","number":9,"label":"sleeping","focused":false,"pane_count":1,"tab_count":1,"active_tab_id":"w9:t1","agent_status":"unknown"},"tab":{"tab_id":"w9:t1","workspace_id":"w9","number":1,"label":"1","focused":false,"pane_count":1,"agent_status":"unknown"},"root_pane":{"pane_id":"w9:p1","workspace_id":"w9","tab_id":"w9:t1"}}"#,
+            ),
+            reply(
+                r#"{"type":"layout_apply","layout":{"workspace_id":"w9","tab_id":"w9:t2","zoomed":false,"focused_pane_id":"w9:p2","root":{"type":"pane","pane_id":"w9:p2","cwd":"/sleeping","command":["claude"]}}}"#,
             ),
         ],
     );
@@ -296,10 +301,24 @@ fn picker_space_restores_a_saved_workspace() {
         String::from_utf8_lossy(&output.stderr)
     );
     let seen = requests.lock().unwrap();
-    assert_eq!(seen[1]["method"], "layout.apply");
-    assert_eq!(seen[1]["params"]["focus"], true);
-    assert_eq!(seen[1]["params"]["tab_label"], "sleeping");
-    assert_eq!(seen[1]["params"]["root"]["command"][0], "claude");
+    let methods: Vec<_> = seen
+        .iter()
+        .map(|request| request["method"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        methods,
+        ["workspace.list", "workspace.create", "layout.apply"]
+    );
+    // 復元先 workspace の作成。focus は layout 完成後に apply 側で移す
+    assert_eq!(seen[1]["params"]["label"], "sleeping");
+    assert_eq!(seen[1]["params"]["focus"], false);
+    // workspace.create が作った初期 tab を置換する。tab_id と workspace_id の
+    // 併用は herdr が invalid_target で拒否するので tab_id 単独でなければならない
+    assert_eq!(seen[2]["params"]["tab_id"], "w9:t1");
+    assert!(seen[2]["params"].get("workspace_id").is_none());
+    assert_eq!(seen[2]["params"]["focus"], true);
+    assert_eq!(seen[2]["params"]["tab_label"], "sleeping");
+    assert_eq!(seen[2]["params"]["root"]["command"][0], "claude");
 }
 
 #[test]
