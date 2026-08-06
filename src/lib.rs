@@ -43,12 +43,13 @@ impl From<StoredDefinition> for Definition {
         match stored {
             StoredDefinition::Tabs(definition) => definition,
             StoredDefinition::Legacy { label, root } => Self {
-                label,
                 tabs: vec![TabDefinition {
-                    label: None,
+                    // 旧形式の復元は workspace label を tab 名に使う (v0.1.4 互換)
+                    label: Some(label.clone()),
                     active: true,
                     root,
                 }],
+                label,
             },
         }
     }
@@ -130,16 +131,22 @@ struct TabListResult {
     tabs: Vec<TabRow>,
 }
 
+// protocol 17 の PaneProcessInfo は pane_id 以外すべて optional / nullable。
+// 子 process 1件の argv 欠落で応答全体を落とさないよう、スキーマどおりに受ける
 #[derive(Deserialize)]
 struct ForegroundProcess {
     pid: u64,
-    argv: Vec<String>,
+    #[serde(default)]
+    argv: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
 struct ProcessInfo {
-    shell_pid: u64,
-    foreground_process_group_id: u64,
+    #[serde(default)]
+    shell_pid: Option<u64>,
+    #[serde(default)]
+    foreground_process_group_id: Option<u64>,
+    #[serde(default)]
     foreground_processes: Vec<ForegroundProcess>,
 }
 
@@ -419,7 +426,7 @@ fn snapshot_definition(herdr: &Herdr, workspace: &Workspace) -> Result<Definitio
     let mut tabs = Vec::new();
     for tab in herdr.tabs(&workspace.id)? {
         let mut root = herdr.export_tab(&tab.tab_id)?;
-        capture_commands(herdr, &mut root);
+        capture_commands(herdr, &mut root)?;
         tabs.push(TabDefinition {
             active: tab.tab_id == workspace.active_tab_id,
             label: Some(tab.label),
@@ -436,41 +443,42 @@ fn snapshot_definition(herdr: &Herdr, workspace: &Workspace) -> Result<Definitio
 }
 
 /// pane の前景コマンドを決める。復元して意味があるのは前景 process group の
-/// leader だけで、次は保存しない: shell 自身 (素の shell は素の shell に戻る)、
-/// `pen` 自身 (対話実行中の save では pen が前景 leader になる)、argv が
-/// 取れなかった process、leader 以外の子 process。
+/// leader だけで、次は保存しない: 前景なし、shell 自身 (素の shell は素の
+/// shell に戻る)、`pen` 自身 (対話実行中の save では pen が前景 leader に
+/// なる)、argv が取れなかった process、leader 以外の子 process。
 fn command_from_process_info(info: &ProcessInfo, self_pid: u64) -> Option<Vec<String>> {
-    if info.foreground_process_group_id == info.shell_pid
-        || info.foreground_process_group_id == self_pid
-    {
+    let leader = info.foreground_process_group_id?;
+    if Some(leader) == info.shell_pid || leader == self_pid {
         return None;
     }
     info.foreground_processes
         .iter()
-        .find(|process| process.pid == info.foreground_process_group_id)
-        .map(|process| process.argv.clone())
+        .find(|process| process.pid == leader)
+        .and_then(|process| process.argv.clone())
         .filter(|argv| !argv.is_empty())
 }
 
 /// `layout.export` は実行中コマンドを含まないので、`pane.process_info` で
-/// 前景コマンドを補う。取得失敗は警告に留め、layout だけでも保存する。
-fn capture_commands(herdr: &Herdr, node: &mut LayoutNode) {
+/// 前景コマンドを補う。command は保存内容そのものなので、取得失敗は save 全体を
+/// 失敗させ、既存の定義ファイルを不完全な内容で上書きしない (前景コマンドが
+/// 単に無い pane は正常な command なしとして保存する)。
+fn capture_commands(herdr: &Herdr, node: &mut LayoutNode) -> Result<()> {
     match node {
         LayoutNode::Pane {
             command, pane_id, ..
         } => {
-            let Some(pane_id) = pane_id else { return };
-            match herdr.pane_command(pane_id) {
-                Ok(Some(argv)) => *command = Some(argv),
-                Ok(None) => {}
-                Err(error) => eprintln!("pen: cannot inspect pane {pane_id}: {error}"),
+            if let Some(pane_id) = pane_id
+                && let Some(argv) = herdr.pane_command(pane_id)?
+            {
+                *command = Some(argv);
             }
         }
         LayoutNode::Split { first, second, .. } => {
-            capture_commands(herdr, first);
-            capture_commands(herdr, second);
+            capture_commands(herdr, first)?;
+            capture_commands(herdr, second)?;
         }
     }
+    Ok(())
 }
 
 fn picker(herdr: &Herdr, config: &Path) -> Result<()> {
@@ -627,13 +635,13 @@ mod tests {
 
     fn info(shell_pid: u64, leader: u64, processes: &[(u64, &[&str])]) -> ProcessInfo {
         ProcessInfo {
-            shell_pid,
-            foreground_process_group_id: leader,
+            shell_pid: Some(shell_pid),
+            foreground_process_group_id: Some(leader),
             foreground_processes: processes
                 .iter()
                 .map(|(pid, argv)| ForegroundProcess {
                     pid: *pid,
-                    argv: argv.iter().map(ToString::to_string).collect(),
+                    argv: Some(argv.iter().map(ToString::to_string).collect()),
                 })
                 .collect(),
         }
@@ -660,5 +668,27 @@ mod tests {
         // leader の argv が取れない場合は command を書かない
         let no_argv = info(100, 200, &[(200, &[])]);
         assert_eq!(command_from_process_info(&no_argv, 999), None);
+    }
+
+    #[test]
+    fn nullable_process_info_fields_degrade_to_no_command() {
+        // protocol 17 では shell_pid / fg group / argv すべて nullable。
+        // 前景 group が不明なら command なし
+        let no_foreground = ProcessInfo {
+            shell_pid: Some(100),
+            foreground_process_group_id: None,
+            foreground_processes: vec![],
+        };
+        assert_eq!(command_from_process_info(&no_foreground, 999), None);
+        // leader の argv が null でも他 field の deserialize は成立し、command なし
+        let null_argv = ProcessInfo {
+            shell_pid: None,
+            foreground_process_group_id: Some(200),
+            foreground_processes: vec![ForegroundProcess {
+                pid: 200,
+                argv: None,
+            }],
+        };
+        assert_eq!(command_from_process_info(&null_argv, 999), None);
     }
 }

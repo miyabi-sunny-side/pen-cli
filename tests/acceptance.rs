@@ -271,6 +271,51 @@ fn save_succeeds_and_warns_when_the_toast_cannot_be_shown() {
 }
 
 #[test]
+fn save_fails_and_keeps_the_old_definition_when_a_pane_cannot_be_inspected() {
+    let temp = TempDir::new("save-inspect-failure");
+    let config = temp.0.join("config");
+    fs::create_dir_all(&config).unwrap();
+    // command は保存内容そのもの: 捕捉に失敗した不完全な snapshot で
+    // 既存の定義を上書きしてはならない
+    let original = "label = \"demo/project\"\n\n[root]\ntype = \"pane\"\ncwd = \"/old\"\n";
+    fs::write(config.join("demo_project.toml"), original).unwrap();
+    let socket = temp.0.join("herdr.sock");
+    let (_requests, server) = mock_herdr(
+        &socket,
+        vec![
+            reply(
+                r#"{"type":"pane_current","pane":{"pane_id":"w7:p1","workspace_id":"w7","tab_id":"w7:t1"}}"#,
+            ),
+            reply(
+                r#"{"type":"workspace_list","workspaces":[{"workspace_id":"w7","active_tab_id":"w7:t1","label":"demo/project","focused":true}]}"#,
+            ),
+            reply(
+                r#"{"type":"tab_list","tabs":[{"tab_id":"w7:t1","workspace_id":"w7","number":1,"label":"1","focused":true,"pane_count":1,"agent_status":"unknown"}]}"#,
+            ),
+            reply(
+                r#"{"type":"layout_export","layout":{"workspace_id":"w7","tab_id":"w7:t1","zoomed":false,"focused_pane_id":"w7:p1","root":{"type":"pane","pane_id":"w7:p1","cwd":"/work"}}}"#,
+            ),
+            r#"{"id":"test","error":{"code":"internal","message":"process scan failed"}}"#
+                .to_owned(),
+        ],
+    );
+
+    let output = pen(&temp, &socket).arg("save").output().unwrap();
+    server.join().unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("pane.process_info") && stderr.contains("process scan failed"),
+        "stderr should name the failed call: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(config.join("demo_project.toml")).unwrap(),
+        original
+    );
+}
+
+#[test]
 fn close_keeps_the_saved_definition_and_closes_the_current_workspace() {
     let temp = TempDir::new("close");
     let config = temp.0.join("config");
@@ -330,7 +375,7 @@ fn picker_space_restores_a_legacy_single_root_definition() {
         vec![
             reply(r#"{"type":"workspace_list","workspaces":[]}"#),
             reply(
-                r#"{"type":"workspace_created","workspace":{"workspace_id":"w9","number":9,"label":"sleeping","focused":false,"pane_count":1,"tab_count":1,"active_tab_id":"w9:t1","agent_status":"unknown"},"tab":{"tab_id":"w9:t1","workspace_id":"w9","number":1,"label":"1","focused":false,"pane_count":1,"agent_status":"unknown"},"root_pane":{"pane_id":"w9:p1","workspace_id":"w9","tab_id":"w9:t1"}}"#,
+                r#"{"type":"workspace_created","workspace":{"workspace_id":"w9","number":9,"label":"sleeping","focused":false,"pane_count":1,"tab_count":1,"active_tab_id":"w9:t1","agent_status":"unknown"},"tab":{"tab_id":"w9:t1","workspace_id":"w9","number":1,"label":"1","focused":false,"pane_count":1,"agent_status":"unknown"},"root_pane":{"pane_id":"w9:p1","terminal_id":"term_w9p1","workspace_id":"w9","tab_id":"w9:t1","focused":false,"agent_status":"unknown","revision":1}}"#,
             ),
             reply(
                 r#"{"type":"layout_apply","layout":{"workspace_id":"w9","tab_id":"w9:t2","zoomed":false,"focused_pane_id":"w9:p2","root":{"type":"pane","pane_id":"w9:p2","cwd":"/sleeping","command":["claude"]}}}"#,
@@ -374,6 +419,8 @@ fn picker_space_restores_a_legacy_single_root_definition() {
     assert_eq!(seen[2]["params"]["tab_id"], "w9:t1");
     assert!(seen[2]["params"].get("workspace_id").is_none());
     assert_eq!(seen[2]["params"]["focus"], false);
+    // 旧形式は tab 名を持たないので workspace label を tab 名に使う (v0.1.4 互換)
+    assert_eq!(seen[2]["params"]["tab_label"], "sleeping");
     assert_eq!(seen[2]["params"]["root"]["command"][0], "claude");
     // focus は全 tab が揃ってから: 置換後の tab_id → workspace の順
     assert_eq!(seen[3]["params"]["tab_id"], "w9:t2");
@@ -405,7 +452,7 @@ fn picker_enter_restores_every_tab_of_a_multi_tab_definition() {
         vec![
             reply(r#"{"type":"workspace_list","workspaces":[]}"#),
             reply(
-                r#"{"type":"workspace_created","workspace":{"workspace_id":"w9","number":9,"label":"agents","focused":false,"pane_count":1,"tab_count":1,"active_tab_id":"w9:t1","agent_status":"unknown"},"tab":{"tab_id":"w9:t1","workspace_id":"w9","number":1,"label":"1","focused":false,"pane_count":1,"agent_status":"unknown"},"root_pane":{"pane_id":"w9:p1","workspace_id":"w9","tab_id":"w9:t1"}}"#,
+                r#"{"type":"workspace_created","workspace":{"workspace_id":"w9","number":9,"label":"agents","focused":false,"pane_count":1,"tab_count":1,"active_tab_id":"w9:t1","agent_status":"unknown"},"tab":{"tab_id":"w9:t1","workspace_id":"w9","number":1,"label":"1","focused":false,"pane_count":1,"agent_status":"unknown"},"root_pane":{"pane_id":"w9:p1","terminal_id":"term_w9p1","workspace_id":"w9","tab_id":"w9:t1","focused":false,"agent_status":"unknown","revision":1}}"#,
             ),
             reply(
                 r#"{"type":"layout_apply","layout":{"workspace_id":"w9","tab_id":"w9:t2","zoomed":false,"focused_pane_id":"w9:p2","root":{"type":"pane","pane_id":"w9:p2","cwd":"/work","command":["claude"]}}}"#,
