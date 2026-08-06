@@ -24,6 +24,8 @@ struct Definition {
 struct TabDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     label: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    active: bool,
     root: LayoutNode,
 }
 
@@ -42,7 +44,11 @@ impl From<StoredDefinition> for Definition {
             StoredDefinition::Tabs(definition) => definition,
             StoredDefinition::Legacy { label, root } => Self {
                 label,
-                tabs: vec![TabDefinition { label: None, root }],
+                tabs: vec![TabDefinition {
+                    label: None,
+                    active: true,
+                    root,
+                }],
             },
         }
     }
@@ -76,6 +82,9 @@ enum LayoutNode {
 struct Workspace {
     #[serde(rename = "workspace_id")]
     id: String,
+    // active tab の判定は workspace.list のこの値で行う。TabInfo.focused は
+    // focus されていない workspace では全 tab false になり判定に使えない (実測)
+    active_tab_id: String,
     label: String,
 }
 
@@ -242,20 +251,14 @@ impl Herdr {
             .tabs)
     }
 
-    /// pane の前景コマンドを返す。前景 process group が shell 自身なら None
-    /// (素の shell は復元時にも素の shell でよい)。
     fn pane_command(&self, pane_id: &str) -> Result<Option<Vec<String>>> {
         let info = self
             .call::<ProcessInfoResult>("pane.process_info", &json!({ "pane_id": pane_id }))?
             .process_info;
-        if info.foreground_process_group_id == info.shell_pid {
-            return Ok(None);
-        }
-        Ok(info
-            .foreground_processes
-            .iter()
-            .find(|process| process.pid == info.foreground_process_group_id)
-            .map(|process| process.argv.clone()))
+        Ok(command_from_process_info(
+            &info,
+            u64::from(std::process::id()),
+        ))
     }
 
     fn focus_tab(&self, tab_id: &str) -> Result<()> {
@@ -308,8 +311,9 @@ impl Herdr {
                 }),
             )
             .map_err(hint)?;
+        let mut restored_tab_ids = vec![applied.layout.tab_id];
         for tab in rest {
-            let _: Value = self
+            let applied: LayoutApplyResult = self
                 .call(
                     "layout.apply",
                     &json!({
@@ -320,9 +324,15 @@ impl Herdr {
                     }),
                 )
                 .map_err(hint)?;
+            restored_tab_ids.push(applied.layout.tab_id);
         }
-        // 全 tab が揃ってから tab 1 を選び、workspace ごと前面へ
-        self.focus_tab(&applied.layout.tab_id).map_err(hint)?;
+        // 全 tab が揃ってから、保存時に active だった tab を選んで前面へ
+        let active = definition
+            .tabs
+            .iter()
+            .position(|tab| tab.active)
+            .unwrap_or(0);
+        self.focus_tab(&restored_tab_ids[active]).map_err(hint)?;
         self.focus(&created.workspace.workspace_id).map_err(hint)?;
         Ok(())
     }
@@ -411,6 +421,7 @@ fn snapshot_definition(herdr: &Herdr, workspace: &Workspace) -> Result<Definitio
         let mut root = herdr.export_tab(&tab.tab_id)?;
         capture_commands(herdr, &mut root);
         tabs.push(TabDefinition {
+            active: tab.tab_id == workspace.active_tab_id,
             label: Some(tab.label),
             root,
         });
@@ -422,6 +433,23 @@ fn snapshot_definition(herdr: &Herdr, workspace: &Workspace) -> Result<Definitio
         label: workspace.label.clone(),
         tabs,
     })
+}
+
+/// pane の前景コマンドを決める。復元して意味があるのは前景 process group の
+/// leader だけで、次は保存しない: shell 自身 (素の shell は素の shell に戻る)、
+/// `pen` 自身 (対話実行中の save では pen が前景 leader になる)、argv が
+/// 取れなかった process、leader 以外の子 process。
+fn command_from_process_info(info: &ProcessInfo, self_pid: u64) -> Option<Vec<String>> {
+    if info.foreground_process_group_id == info.shell_pid
+        || info.foreground_process_group_id == self_pid
+    {
+        return None;
+    }
+    info.foreground_processes
+        .iter()
+        .find(|process| process.pid == info.foreground_process_group_id)
+        .map(|process| process.argv.clone())
+        .filter(|argv| !argv.is_empty())
 }
 
 /// `layout.export` は実行中コマンドを含まないので、`pane.process_info` で
@@ -589,11 +617,48 @@ fn home_dir() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::safe_filename;
+    use super::{ForegroundProcess, ProcessInfo, command_from_process_info, safe_filename};
 
     #[test]
     fn unsafe_label_characters_are_normalized() {
         assert_eq!(safe_filename("demo/project:*?"), "demo_project___");
         assert_eq!(safe_filename("..."), "workspace");
+    }
+
+    fn info(shell_pid: u64, leader: u64, processes: &[(u64, &[&str])]) -> ProcessInfo {
+        ProcessInfo {
+            shell_pid,
+            foreground_process_group_id: leader,
+            foreground_processes: processes
+                .iter()
+                .map(|(pid, argv)| ForegroundProcess {
+                    pid: *pid,
+                    argv: argv.iter().map(ToString::to_string).collect(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn foreground_leader_argv_becomes_the_saved_command() {
+        // leader の argv を保存し、子 process (uv 等) は選ばない
+        let info = info(100, 200, &[(200, &["claude"]), (201, &["uv", "tool"])]);
+        assert_eq!(
+            command_from_process_info(&info, 999),
+            Some(vec!["claude".to_owned()])
+        );
+    }
+
+    #[test]
+    fn idle_shell_and_pen_itself_are_not_saved_as_commands() {
+        // 素の shell: 前景 group が shell 自身
+        let idle = info(100, 100, &[(100, &["/usr/bin/zsh"])]);
+        assert_eq!(command_from_process_info(&idle, 999), None);
+        // 対話実行中の save では pen 自身が前景 leader になる
+        let running_pen = info(100, 555, &[(555, &["pen", "save"])]);
+        assert_eq!(command_from_process_info(&running_pen, 555), None);
+        // leader の argv が取れない場合は command を書かない
+        let no_argv = info(100, 200, &[(200, &[])]);
+        assert_eq!(command_from_process_info(&no_argv, 999), None);
     }
 }

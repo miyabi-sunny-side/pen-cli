@@ -163,6 +163,9 @@ fn save_persists_every_tab_with_foreground_commands_as_toml() {
     assert_eq!(saved.matches("[[tabs]]").count(), 2);
     assert!(saved.contains("label = \"agent\""));
     assert!(saved.contains("label = \"docs\""));
+    // 保存時の active tab (workspace.active_tab_id = w7:t1 = agent) だけに記す
+    assert_eq!(saved.matches("active = true").count(), 1);
+    assert!(saved.find("active = true").unwrap() < saved.find("label = \"docs\"").unwrap());
     assert!(saved.contains("direction = \"right\""));
     // 前景コマンドが pane に載る。素の shell (w7:p2) には command を書かない
     assert!(saved.contains("command = [\"claude\"]"));
@@ -388,7 +391,7 @@ fn picker_enter_restores_every_tab_of_a_multi_tab_definition() {
             "label = \"agents\"\n\n",
             "[[tabs]]\nlabel = \"agent\"\n\n",
             "[tabs.root]\ntype = \"pane\"\ncwd = \"/work\"\ncommand = [\"claude\"]\n\n",
-            "[[tabs]]\nlabel = \"docs\"\n\n",
+            "[[tabs]]\nlabel = \"docs\"\nactive = true\n\n",
             "[tabs.root]\ntype = \"pane\"\ncwd = \"/work/docs\"\ncommand = [\"codex\"]\n",
         ),
     )
@@ -456,8 +459,9 @@ fn picker_enter_restores_every_tab_of_a_multi_tab_definition() {
     assert_eq!(seen[3]["params"]["tab_label"], "docs");
     assert_eq!(seen[3]["params"]["focus"], false);
     assert_eq!(seen[3]["params"]["root"]["command"][0], "codex");
-    // 全 tab が揃ってから tab 1 (置換後の実 tab_id) を選び workspace を前面へ
-    assert_eq!(seen[4]["params"]["tab_id"], "w9:t2");
+    // 全 tab が揃ってから、保存時に active だった tab (docs = 2 本目の実 tab_id)
+    // を選び workspace を前面へ
+    assert_eq!(seen[4]["params"]["tab_id"], "w9:t3");
     assert_eq!(seen[5]["params"]["workspace_id"], "w9");
 }
 
