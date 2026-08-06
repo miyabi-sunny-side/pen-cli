@@ -316,6 +316,53 @@ fn save_fails_and_keeps_the_old_definition_when_a_pane_cannot_be_inspected() {
 }
 
 #[test]
+fn save_fails_when_a_foreground_command_cannot_be_determined() {
+    let temp = TempDir::new("save-no-argv");
+    let config = temp.0.join("config");
+    fs::create_dir_all(&config).unwrap();
+    // 応答としては valid だが、前景 leader (pid 200) の argv が null。
+    // 「実行中の何かがある」と分かっているのに command を特定できない snapshot は
+    // 素の shell と同じ成功にせず、既存の完全な定義を守る
+    let original = "label = \"demo/project\"\n\n[root]\ntype = \"pane\"\ncwd = \"/old\"\n";
+    fs::write(config.join("demo_project.toml"), original).unwrap();
+    let socket = temp.0.join("herdr.sock");
+    let (_requests, server) = mock_herdr(
+        &socket,
+        vec![
+            reply(
+                r#"{"type":"pane_current","pane":{"pane_id":"w7:p1","workspace_id":"w7","tab_id":"w7:t1"}}"#,
+            ),
+            reply(
+                r#"{"type":"workspace_list","workspaces":[{"workspace_id":"w7","active_tab_id":"w7:t1","label":"demo/project","focused":true}]}"#,
+            ),
+            reply(
+                r#"{"type":"tab_list","tabs":[{"tab_id":"w7:t1","workspace_id":"w7","number":1,"label":"1","focused":true,"pane_count":1,"agent_status":"unknown"}]}"#,
+            ),
+            reply(
+                r#"{"type":"layout_export","layout":{"workspace_id":"w7","tab_id":"w7:t1","zoomed":false,"focused_pane_id":"w7:p1","root":{"type":"pane","pane_id":"w7:p1","cwd":"/work"}}}"#,
+            ),
+            reply(
+                r#"{"type":"pane_process_info","process_info":{"pane_id":"w7:p1","shell_pid":100,"foreground_process_group_id":200,"foreground_processes":[{"pid":200,"name":"claude","argv":null,"cmdline":null,"cwd":"/work"}]}}"#,
+            ),
+        ],
+    );
+
+    let output = pen(&temp, &socket).arg("save").output().unwrap();
+    server.join().unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("w7:p1") && stderr.contains("no argv"),
+        "stderr should name the pane and the missing argv: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(config.join("demo_project.toml")).unwrap(),
+        original
+    );
+}
+
+#[test]
 fn close_keeps_the_saved_definition_and_closes_the_current_workspace() {
     let temp = TempDir::new("close");
     let config = temp.0.join("config");

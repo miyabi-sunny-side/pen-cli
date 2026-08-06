@@ -262,10 +262,8 @@ impl Herdr {
         let info = self
             .call::<ProcessInfoResult>("pane.process_info", &json!({ "pane_id": pane_id }))?
             .process_info;
-        Ok(command_from_process_info(
-            &info,
-            u64::from(std::process::id()),
-        ))
+        command_from_process_info(&info, u64::from(std::process::id()))
+            .map_err(|error| format!("cannot save pane {pane_id}: {error}").into())
     }
 
     fn focus_tab(&self, tab_id: &str) -> Result<()> {
@@ -443,19 +441,27 @@ fn snapshot_definition(herdr: &Herdr, workspace: &Workspace) -> Result<Definitio
 }
 
 /// pane の前景コマンドを決める。復元して意味があるのは前景 process group の
-/// leader だけで、次は保存しない: 前景なし、shell 自身 (素の shell は素の
-/// shell に戻る)、`pen` 自身 (対話実行中の save では pen が前景 leader に
-/// なる)、argv が取れなかった process、leader 以外の子 process。
-fn command_from_process_info(info: &ProcessInfo, self_pid: u64) -> Option<Vec<String>> {
-    let leader = info.foreground_process_group_id?;
+/// leader だけ。「前景が無い」(前景なし・shell 自身・save を実行中の `pen`
+/// 自身) は正常な command なし。一方、leader が確定しているのに argv を
+/// 特定できないのは取得失敗であり、command 欠落の TOML で既存定義を
+/// 上書きしないためエラーにする。leader 以外の子 process は見ない。
+fn command_from_process_info(info: &ProcessInfo, self_pid: u64) -> Result<Option<Vec<String>>> {
+    let Some(leader) = info.foreground_process_group_id else {
+        return Ok(None);
+    };
     if Some(leader) == info.shell_pid || leader == self_pid {
-        return None;
+        return Ok(None);
     }
-    info.foreground_processes
+    let argv = info
+        .foreground_processes
         .iter()
         .find(|process| process.pid == leader)
-        .and_then(|process| process.argv.clone())
+        .ok_or_else(|| format!("foreground process group {leader} is not in the process list"))?
+        .argv
+        .as_ref()
         .filter(|argv| !argv.is_empty())
+        .ok_or_else(|| format!("foreground process {leader} has no argv"))?;
+    Ok(Some(argv.clone()))
 }
 
 /// `layout.export` は実行中コマンドを含まないので、`pane.process_info` で
@@ -649,38 +655,42 @@ mod tests {
 
     #[test]
     fn foreground_leader_argv_becomes_the_saved_command() {
-        // leader の argv を保存し、子 process (uv 等) は選ばない
-        let info = info(100, 200, &[(200, &["claude"]), (201, &["uv", "tool"])]);
+        // leader の argv を保存し、子 process (uv 等) は選ばない。
+        // 子の argv が null でも leader 探索対象外なので無害
+        let mut info = info(100, 200, &[(200, &["claude"]), (201, &["uv", "tool"])]);
+        info.foreground_processes[1].argv = None;
         assert_eq!(
-            command_from_process_info(&info, 999),
+            command_from_process_info(&info, 999).unwrap(),
             Some(vec!["claude".to_owned()])
         );
     }
 
     #[test]
-    fn idle_shell_and_pen_itself_are_not_saved_as_commands() {
+    fn panes_without_a_real_foreground_are_saved_without_a_command() {
         // 素の shell: 前景 group が shell 自身
         let idle = info(100, 100, &[(100, &["/usr/bin/zsh"])]);
-        assert_eq!(command_from_process_info(&idle, 999), None);
+        assert_eq!(command_from_process_info(&idle, 999).unwrap(), None);
         // 対話実行中の save では pen 自身が前景 leader になる
         let running_pen = info(100, 555, &[(555, &["pen", "save"])]);
-        assert_eq!(command_from_process_info(&running_pen, 555), None);
-        // leader の argv が取れない場合は command を書かない
-        let no_argv = info(100, 200, &[(200, &[])]);
-        assert_eq!(command_from_process_info(&no_argv, 999), None);
-    }
-
-    #[test]
-    fn nullable_process_info_fields_degrade_to_no_command() {
-        // protocol 17 では shell_pid / fg group / argv すべて nullable。
-        // 前景 group が不明なら command なし
+        assert_eq!(command_from_process_info(&running_pen, 555).unwrap(), None);
+        // 前景 group 不明 (nullable) も正常な command なし
         let no_foreground = ProcessInfo {
             shell_pid: Some(100),
             foreground_process_group_id: None,
             foreground_processes: vec![],
         };
-        assert_eq!(command_from_process_info(&no_foreground, 999), None);
-        // leader の argv が null でも他 field の deserialize は成立し、command なし
+        assert_eq!(
+            command_from_process_info(&no_foreground, 999).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unidentifiable_foreground_command_fails_the_snapshot() {
+        // leader は確定しているのに argv を特定できない = 取得失敗。
+        // command 欠落の TOML を「素の shell」と同じ成功にしない
+        let missing_leader = info(100, 200, &[(201, &["uv", "tool"])]);
+        assert!(command_from_process_info(&missing_leader, 999).is_err());
         let null_argv = ProcessInfo {
             shell_pid: None,
             foreground_process_group_id: Some(200),
@@ -689,6 +699,8 @@ mod tests {
                 argv: None,
             }],
         };
-        assert_eq!(command_from_process_info(&null_argv, 999), None);
+        assert!(command_from_process_info(&null_argv, 999).is_err());
+        let empty_argv = info(100, 200, &[(200, &[])]);
+        assert!(command_from_process_info(&empty_argv, 999).is_err());
     }
 }
