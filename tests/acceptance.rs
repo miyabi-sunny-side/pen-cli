@@ -90,6 +90,10 @@ fn mock_herdr(
                     Err(error) => panic!("mock herdr accept failed: {error}"),
                 }
             };
+            // macOS (BSD) では accept した stream が listener の non-blocking を
+            // 継承する。client の書き込み前に read すると EAGAIN で落ちるため、
+            // blocking へ戻して要求の到着を待つ (Linux は元々 blocking)
+            stream.set_nonblocking(false).unwrap();
             let mut line = String::new();
             BufReader::new(stream.try_clone().unwrap())
                 .read_line(&mut line)
