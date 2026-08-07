@@ -22,7 +22,7 @@ fn a_version_tag_builds_and_publishes_the_pen_release_assets() {
         "cargo test --locked",
         "cargo build --release --locked --target",
         "pen LICENSE",
-        "softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65",
+        "softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228",
         "generate_release_notes: true",
     ] {
         assert!(
