@@ -460,7 +460,7 @@ fn close_discard_closes_an_unsaved_workspace_without_saving() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("[s]ave") && stderr.contains("[d]iscard") && stderr.contains("[c]ancel"),
+        stderr.contains("[s]ave") && stderr.contains("[d]iscard") && stderr.contains("[C]ancel"),
         "stderr should offer the three close choices: {stderr}"
     );
     // discard は snapshot 系 RPC を一切呼ばず、TOML も作らない
@@ -519,7 +519,7 @@ fn close_asks_when_the_workspace_differs_from_its_saved_definition() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("differs") && stderr.contains("[u]pdate"),
+        stderr.contains("differs") && stderr.contains("[u]pdate") && stderr.contains("[C]ancel"),
         "stderr should ask about the mismatch: {stderr}"
     );
     assert_eq!(
@@ -664,12 +664,12 @@ fn picker_space_restores_a_legacy_definition_and_keeps_the_picker_open() {
 }
 
 #[test]
-fn picker_space_then_enter_closes_two_running_workspaces() {
+fn picker_space_closes_then_enter_focuses_a_running_workspace() {
     let temp = TempDir::new("picker-running");
     let socket = temp.0.join("herdr.sock");
     // user の主目的「2個消して次を操作」の稼働中(●)側: 1回目 Space の close 後も
-    // picker が続き、2回目 Enter は close して終了する。Enter+稼働中が旧挙動の
-    // workspace.focus に戻る退行もここで検知する
+    // picker が続く。2回目 Enter は決定キーとして workspace.focus で移動する
+    // だけで、beta を閉じてはならない
     let fake_fzf = temp.0.join("fzf");
     fs::write(
         &fake_fzf,
@@ -687,7 +687,7 @@ fn picker_space_then_enter_closes_two_running_workspaces() {
             reply(
                 r#"{"type":"workspace_list","workspaces":[{"workspace_id":"w2","active_tab_id":"w2:t1","label":"beta","focused":true}]}"#,
             ),
-            reply(r#"{"type":"workspace_closed","workspace_id":"w2"}"#),
+            reply(r#"{"type":"workspace_focus"}"#),
         ],
     );
 
@@ -699,8 +699,8 @@ fn picker_space_then_enter_closes_two_running_workspaces() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    // どちらも未保存なので三択が2回出る: 両方 discard で閉じる
-    child.stdin.take().unwrap().write_all(b"d\nd\n").unwrap();
+    // 未保存 alpha への三択1回だけに discard を流す (Enter+beta は質問なし)
+    child.stdin.take().unwrap().write_all(b"d\n").unwrap();
     let output = child.wait_with_output().unwrap();
     server.join().unwrap();
 
@@ -711,23 +711,23 @@ fn picker_space_then_enter_closes_two_running_workspaces() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("closed alpha") && stdout.contains("closed beta"),
-        "both workspaces should be closed: {stdout}"
+        stdout.contains("closed alpha") && !stdout.contains("closed beta"),
+        "only alpha should be closed: {stdout}"
     );
     let seen = requests.lock().unwrap();
     let methods: Vec<_> = seen
         .iter()
         .map(|request| request["method"].as_str().unwrap().to_owned())
         .collect();
-    // Space 後に一覧を作り直すため workspace.list を再取得し、Enter 後は終了。
-    // workspace.focus はどこにも現れない
+    // Space 後に一覧を作り直すため workspace.list を再取得し、Enter は focus
+    // して終了。close は alpha の1回だけ
     assert_eq!(
         methods,
         [
             "workspace.list",
             "workspace.close",
             "workspace.list",
-            "workspace.close"
+            "workspace.focus"
         ]
     );
     assert_eq!(seen[1]["params"]["workspace_id"], "w1");

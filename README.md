@@ -20,7 +20,8 @@ pen picker
 
 Definitions are stored in `~/.config/pen/*.toml`. `pen picker` uses `fzf`; Space toggles the
 selected workspace and keeps the list open for the next toggle (restoring this way does not move
-focus), Enter toggles the selection and closes the picker, and Esc closes it.
+focus), Enter focuses a running workspace or restores a stopped one and closes the picker, and Esc
+closes it.
 
 `pen close` and closing a running workspace from the picker never discard state silently: an
 unsaved workspace asks save / discard / cancel, and a workspace that differs from its saved

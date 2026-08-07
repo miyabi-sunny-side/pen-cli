@@ -427,7 +427,7 @@ fn resolve_close(herdr: &Herdr, config: &Path, workspace: &Workspace) -> Result<
         return Ok(
             match choose(
                 &format!(
-                    "Workspace {label:?} is not saved. [s]ave and close / [d]iscard and close / [c]ancel "
+                    "Workspace {label:?} is not saved. [s]ave and close / [d]iscard and close / [C]ancel "
                 ),
                 &['s', 'd'],
             )? {
@@ -449,7 +449,7 @@ fn resolve_close(herdr: &Herdr, config: &Path, workspace: &Workspace) -> Result<
             Ok(
                 match choose(
                     &format!(
-                        "Workspace {label:?} differs from its saved definition. [u]pdate and close / [d]iscard changes and close / [c]ancel "
+                        "Workspace {label:?} differs from its saved definition. [u]pdate and close / [d]iscard changes and close / [C]ancel "
                     ),
                     &['u', 'd'],
                 )? {
@@ -465,7 +465,7 @@ fn resolve_close(herdr: &Herdr, config: &Path, workspace: &Workspace) -> Result<
         Err(error) => {
             eprintln!("pen: cannot compare workspace {label:?} with its saved definition: {error}");
             Ok(
-                match choose("[d]iscard changes and close / [c]ancel ", &['d'])? {
+                match choose("[d]iscard changes and close / [C]ancel ", &['d'])? {
                     Some('d') => CloseDecision::Proceed,
                     _ => CloseDecision::Cancelled,
                 },
@@ -542,7 +542,8 @@ fn capture_commands(herdr: &Herdr, node: &mut LayoutNode) -> Result<()> {
     Ok(())
 }
 
-/// Space は一覧を出し直して連続トグル、Enter はトグルして終了、Esc は終了。
+/// Space は一覧を出し直して連続トグル、Enter は稼働中なら focus・停止中なら
+/// 復元して終了 (決定キー)、Esc は終了。
 /// picker は popup として動き pen の exit で popup ごと閉じるため、「一覧を
 /// 維持」は fzf を pen 内の loop で起動し直すことで実現する (トグルごとに
 /// query とカーソル位置はリセットされる)。
@@ -615,14 +616,11 @@ fn picker(herdr: &Herdr, config: &Path) -> Result<()> {
                 herdr.restore(saved_definition(&definitions, label)?, false)?;
                 println!("restored {label}");
             }
-            ("enter", Some(workspace)) => match resolve_close(herdr, config, workspace)? {
-                CloseDecision::Proceed => {
-                    herdr.close(&workspace.id)?;
-                    println!("closed {label}");
-                    return Ok(());
-                }
-                CloseDecision::Cancelled => {}
-            },
+            // Enter は決定キー: 稼働中の workspace へは移動するだけで閉じない
+            ("enter", Some(workspace)) => {
+                herdr.focus(&workspace.id)?;
+                return Ok(());
+            }
             ("enter", None) => {
                 herdr.restore(saved_definition(&definitions, label)?, true)?;
                 println!("restored {label}");
@@ -740,6 +738,8 @@ mod tests {
         assert_eq!(parse_choice("", &['s', 'd']), None);
         assert_eq!(parse_choice("x\n", &['s', 'd']), None);
         assert_eq!(parse_choice("save\n", &['s', 'd']), None);
+        // 明示の C も default と同じ中止 (受理リストに含めないことで成立)
+        assert_eq!(parse_choice("C\n", &['s', 'd']), None);
     }
 
     fn info(shell_pid: u64, leader: u64, processes: &[(u64, &[&str])]) -> ProcessInfo {
