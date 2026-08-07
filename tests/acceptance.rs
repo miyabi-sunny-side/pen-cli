@@ -371,11 +371,10 @@ fn close_keeps_the_saved_definition_and_closes_the_current_workspace() {
     let temp = TempDir::new("close");
     let config = temp.0.join("config");
     fs::create_dir_all(&config).unwrap();
-    fs::write(
-        config.join("demo.toml"),
-        "label = \"demo\"\n\n[root]\ntype = \"pane\"\ncwd = \"/work\"\n",
-    )
-    .unwrap();
+    // 保存定義と実 layout が一致するケース: 比較のための snapshot は走るが、
+    // 質問なしで閉じる (legacy 形式は tab label = workspace label に正規化される)
+    let original = "label = \"demo\"\n\n[root]\ntype = \"pane\"\ncwd = \"/work\"\n";
+    fs::write(config.join("demo.toml"), original).unwrap();
     let socket = temp.0.join("herdr.sock");
     let (requests, server) = mock_herdr(
         &socket,
@@ -385,6 +384,15 @@ fn close_keeps_the_saved_definition_and_closes_the_current_workspace() {
             ),
             reply(
                 r#"{"type":"workspace_list","workspaces":[{"workspace_id":"w2","active_tab_id":"w2:t1","label":"demo","focused":true}]}"#,
+            ),
+            reply(
+                r#"{"type":"tab_list","tabs":[{"tab_id":"w2:t1","workspace_id":"w2","number":1,"label":"demo","focused":true,"pane_count":1,"agent_status":"unknown"}]}"#,
+            ),
+            reply(
+                r#"{"type":"layout_export","layout":{"workspace_id":"w2","tab_id":"w2:t1","zoomed":false,"focused_pane_id":"w2:p1","root":{"type":"pane","pane_id":"w2:p1","cwd":"/work"}}}"#,
+            ),
+            reply(
+                r#"{"type":"pane_process_info","process_info":{"pane_id":"w2:p1","shell_pid":100,"foreground_process_group_id":100,"foreground_processes":[{"pid":100,"name":"zsh","argv":["/usr/bin/zsh"],"cmdline":"/usr/bin/zsh","cwd":"/work"}]}}"#,
             ),
             reply(r#"{"type":"workspace_closed","workspace_id":"w2"}"#),
         ],
@@ -398,14 +406,182 @@ fn close_keeps_the_saved_definition_and_closes_the_current_workspace() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(config.join("demo.toml").exists());
+    assert_eq!(
+        fs::read_to_string(config.join("demo.toml")).unwrap(),
+        original
+    );
     let seen = requests.lock().unwrap();
-    assert_eq!(seen[2]["method"], "workspace.close");
-    assert_eq!(seen[2]["params"]["workspace_id"], "w2");
+    assert_eq!(seen[5]["method"], "workspace.close");
+    assert_eq!(seen[5]["params"]["workspace_id"], "w2");
+}
+
+/// 三択 prompt へ1行流し込んで pen close を実行する
+fn close_with_answer(temp: &TempDir, socket: &Path, answer: &str) -> std::process::Output {
+    let mut child = pen(temp, socket)
+        .arg("close")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(answer.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
 }
 
 #[test]
-fn picker_space_restores_a_legacy_single_root_definition() {
+fn close_discard_closes_an_unsaved_workspace_without_saving() {
+    let temp = TempDir::new("close-discard");
+    let socket = temp.0.join("herdr.sock");
+    let (requests, server) = mock_herdr(
+        &socket,
+        vec![
+            reply(
+                r#"{"type":"pane_current","pane":{"pane_id":"w2:p1","workspace_id":"w2","tab_id":"w2:t1"}}"#,
+            ),
+            reply(
+                r#"{"type":"workspace_list","workspaces":[{"workspace_id":"w2","active_tab_id":"w2:t1","label":"scratch","focused":true}]}"#,
+            ),
+            reply(r#"{"type":"workspace_closed","workspace_id":"w2"}"#),
+        ],
+    );
+
+    let output = close_with_answer(&temp, &socket, "d\n");
+    server.join().unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("[s]ave") && stderr.contains("[d]iscard") && stderr.contains("[c]ancel"),
+        "stderr should offer the three close choices: {stderr}"
+    );
+    // discard は snapshot 系 RPC を一切呼ばず、TOML も作らない
+    let methods: Vec<_> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|request| request["method"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        methods,
+        ["pane.current", "workspace.list", "workspace.close"]
+    );
+    assert!(!temp.0.join("config").exists());
+}
+
+#[test]
+fn close_asks_when_the_workspace_differs_from_its_saved_definition() {
+    let temp = TempDir::new("close-differs");
+    let config = temp.0.join("config");
+    fs::create_dir_all(&config).unwrap();
+    // 保存定義は /old、実 layout は /work: 黙って閉じずに質問し、
+    // discard なら保存定義を書き換えないまま閉じる
+    let original = "label = \"demo\"\n\n[root]\ntype = \"pane\"\ncwd = \"/old\"\n";
+    fs::write(config.join("demo.toml"), original).unwrap();
+    let socket = temp.0.join("herdr.sock");
+    let (requests, server) = mock_herdr(
+        &socket,
+        vec![
+            reply(
+                r#"{"type":"pane_current","pane":{"pane_id":"w2:p1","workspace_id":"w2","tab_id":"w2:t1"}}"#,
+            ),
+            reply(
+                r#"{"type":"workspace_list","workspaces":[{"workspace_id":"w2","active_tab_id":"w2:t1","label":"demo","focused":true}]}"#,
+            ),
+            reply(
+                r#"{"type":"tab_list","tabs":[{"tab_id":"w2:t1","workspace_id":"w2","number":1,"label":"demo","focused":true,"pane_count":1,"agent_status":"unknown"}]}"#,
+            ),
+            reply(
+                r#"{"type":"layout_export","layout":{"workspace_id":"w2","tab_id":"w2:t1","zoomed":false,"focused_pane_id":"w2:p1","root":{"type":"pane","pane_id":"w2:p1","cwd":"/work"}}}"#,
+            ),
+            reply(
+                r#"{"type":"pane_process_info","process_info":{"pane_id":"w2:p1","shell_pid":100,"foreground_process_group_id":100,"foreground_processes":[{"pid":100,"name":"zsh","argv":["/usr/bin/zsh"],"cmdline":"/usr/bin/zsh","cwd":"/work"}]}}"#,
+            ),
+            reply(r#"{"type":"workspace_closed","workspace_id":"w2"}"#),
+        ],
+    );
+
+    let output = close_with_answer(&temp, &socket, "d\n");
+    server.join().unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("differs") && stderr.contains("[u]pdate"),
+        "stderr should ask about the mismatch: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(config.join("demo.toml")).unwrap(),
+        original
+    );
+    let seen = requests.lock().unwrap();
+    assert_eq!(seen.last().unwrap()["method"], "workspace.close");
+}
+
+#[test]
+fn close_update_rewrites_the_saved_definition_before_closing() {
+    let temp = TempDir::new("close-update");
+    let config = temp.0.join("config");
+    fs::create_dir_all(&config).unwrap();
+    fs::write(
+        config.join("demo.toml"),
+        "label = \"demo\"\n\n[root]\ntype = \"pane\"\ncwd = \"/old\"\n",
+    )
+    .unwrap();
+    let socket = temp.0.join("herdr.sock");
+    let (requests, server) = mock_herdr(
+        &socket,
+        vec![
+            reply(
+                r#"{"type":"pane_current","pane":{"pane_id":"w2:p1","workspace_id":"w2","tab_id":"w2:t1"}}"#,
+            ),
+            reply(
+                r#"{"type":"workspace_list","workspaces":[{"workspace_id":"w2","active_tab_id":"w2:t1","label":"demo","focused":true}]}"#,
+            ),
+            reply(
+                r#"{"type":"tab_list","tabs":[{"tab_id":"w2:t1","workspace_id":"w2","number":1,"label":"demo","focused":true,"pane_count":1,"agent_status":"unknown"}]}"#,
+            ),
+            reply(
+                r#"{"type":"layout_export","layout":{"workspace_id":"w2","tab_id":"w2:t1","zoomed":false,"focused_pane_id":"w2:p1","root":{"type":"pane","pane_id":"w2:p1","cwd":"/work"}}}"#,
+            ),
+            reply(
+                r#"{"type":"pane_process_info","process_info":{"pane_id":"w2:p1","shell_pid":100,"foreground_process_group_id":100,"foreground_processes":[{"pid":100,"name":"zsh","argv":["/usr/bin/zsh"],"cmdline":"/usr/bin/zsh","cwd":"/work"}]}}"#,
+            ),
+            reply(r#"{"type":"workspace_closed","workspace_id":"w2"}"#),
+        ],
+    );
+
+    let output = close_with_answer(&temp, &socket, "u\n");
+    server.join().unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let updated = fs::read_to_string(config.join("demo.toml")).unwrap();
+    assert!(
+        updated.contains("cwd = \"/work\"") && !updated.contains("/old"),
+        "definition should be rewritten from the live layout: {updated}"
+    );
+    let seen = requests.lock().unwrap();
+    assert_eq!(seen.last().unwrap()["method"], "workspace.close");
+}
+
+#[test]
+fn picker_space_restores_a_legacy_definition_and_keeps_the_picker_open() {
     let temp = TempDir::new("picker");
     let config = temp.0.join("config");
     fs::create_dir_all(&config).unwrap();
@@ -415,8 +591,14 @@ fn picker_space_restores_a_legacy_single_root_definition() {
         "label = \"sleeping\"\n\n[root]\ntype = \"pane\"\ncwd = \"/sleeping\"\ncommand = [\"claude\"]\n",
     )
     .unwrap();
+    // Space はトグル後も picker が続く: fzf は2回起動される (1回目 Space →
+    // 2回目 Esc)。fake fzf は状態ファイルで自分の起動回数を数える
     let fake_fzf = temp.0.join("fzf");
-    fs::write(&fake_fzf, "#!/bin/sh\nprintf 'space\\n○\\tsleeping\\n'\n").unwrap();
+    fs::write(
+        &fake_fzf,
+        "#!/bin/sh\nif [ -f \"$0.ran\" ]; then\n  printf 'esc\\n'\nelse\n  : > \"$0.ran\"\n  printf 'space\\n○\\tsleeping\\n'\nfi\n",
+    )
+    .unwrap();
     fs::set_permissions(&fake_fzf, fs::Permissions::from_mode(0o755)).unwrap();
     let socket = temp.0.join("herdr.sock");
     // 復元先 workspace は pen が workspace.create で作る。layout.apply 単発では
@@ -432,7 +614,9 @@ fn picker_space_restores_a_legacy_single_root_definition() {
                 r#"{"type":"layout_apply","layout":{"workspace_id":"w9","tab_id":"w9:t2","zoomed":false,"focused_pane_id":"w9:p2","root":{"type":"pane","pane_id":"w9:p2","cwd":"/sleeping","command":["claude"]}}}"#,
             ),
             reply(r#"{"type":"tab_focus"}"#),
-            reply(r#"{"type":"workspace_focus"}"#),
+            reply(
+                r#"{"type":"workspace_list","workspaces":[{"workspace_id":"w9","active_tab_id":"w9:t2","label":"sleeping","focused":false}]}"#,
+            ),
         ],
     );
 
@@ -453,6 +637,8 @@ fn picker_space_restores_a_legacy_single_root_definition() {
         .iter()
         .map(|request| request["method"].as_str().unwrap().to_owned())
         .collect();
+    // Space の復元は workspace.focus を呼ばず (連続操作の妨げになる)、
+    // トグル後に一覧を作り直すため workspace.list をもう一度取る
     assert_eq!(
         methods,
         [
@@ -460,7 +646,7 @@ fn picker_space_restores_a_legacy_single_root_definition() {
             "workspace.create",
             "layout.apply",
             "tab.focus",
-            "workspace.focus"
+            "workspace.list"
         ]
     );
     assert_eq!(seen[1]["params"]["label"], "sleeping");
@@ -473,9 +659,79 @@ fn picker_space_restores_a_legacy_single_root_definition() {
     // 旧形式は tab 名を持たないので workspace label を tab 名に使う (v0.1.4 互換)
     assert_eq!(seen[2]["params"]["tab_label"], "sleeping");
     assert_eq!(seen[2]["params"]["root"]["command"][0], "claude");
-    // focus は全 tab が揃ってから: 置換後の tab_id → workspace の順
+    // active tab の選択は workspace 内で閉じ、focus は移さない
     assert_eq!(seen[3]["params"]["tab_id"], "w9:t2");
-    assert_eq!(seen[4]["params"]["workspace_id"], "w9");
+}
+
+#[test]
+fn picker_space_then_enter_closes_two_running_workspaces() {
+    let temp = TempDir::new("picker-running");
+    let socket = temp.0.join("herdr.sock");
+    // user の主目的「2個消して次を操作」の稼働中(●)側: 1回目 Space の close 後も
+    // picker が続き、2回目 Enter は close して終了する。Enter+稼働中が旧挙動の
+    // workspace.focus に戻る退行もここで検知する
+    let fake_fzf = temp.0.join("fzf");
+    fs::write(
+        &fake_fzf,
+        "#!/bin/sh\nif [ -f \"$0.ran\" ]; then\n  printf 'enter\\n●\\tbeta\\n'\nelse\n  : > \"$0.ran\"\n  printf 'space\\n●\\talpha\\n'\nfi\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_fzf, fs::Permissions::from_mode(0o755)).unwrap();
+    let (requests, server) = mock_herdr(
+        &socket,
+        vec![
+            reply(
+                r#"{"type":"workspace_list","workspaces":[{"workspace_id":"w1","active_tab_id":"w1:t1","label":"alpha","focused":true},{"workspace_id":"w2","active_tab_id":"w2:t1","label":"beta","focused":false}]}"#,
+            ),
+            reply(r#"{"type":"workspace_closed","workspace_id":"w1"}"#),
+            reply(
+                r#"{"type":"workspace_list","workspaces":[{"workspace_id":"w2","active_tab_id":"w2:t1","label":"beta","focused":true}]}"#,
+            ),
+            reply(r#"{"type":"workspace_closed","workspace_id":"w2"}"#),
+        ],
+    );
+
+    let mut child = pen(&temp, &socket)
+        .env("PEN_FZF", &fake_fzf)
+        .arg("picker")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // どちらも未保存なので三択が2回出る: 両方 discard で閉じる
+    child.stdin.take().unwrap().write_all(b"d\nd\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    server.join().unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("closed alpha") && stdout.contains("closed beta"),
+        "both workspaces should be closed: {stdout}"
+    );
+    let seen = requests.lock().unwrap();
+    let methods: Vec<_> = seen
+        .iter()
+        .map(|request| request["method"].as_str().unwrap().to_owned())
+        .collect();
+    // Space 後に一覧を作り直すため workspace.list を再取得し、Enter 後は終了。
+    // workspace.focus はどこにも現れない
+    assert_eq!(
+        methods,
+        [
+            "workspace.list",
+            "workspace.close",
+            "workspace.list",
+            "workspace.close"
+        ]
+    );
+    assert_eq!(seen[1]["params"]["workspace_id"], "w1");
+    assert_eq!(seen[3]["params"]["workspace_id"], "w2");
 }
 
 #[test]

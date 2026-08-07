@@ -286,7 +286,7 @@ impl Herdr {
         Ok(())
     }
 
-    fn restore(&self, definition: &Definition) -> Result<()> {
+    fn restore(&self, definition: &Definition, focus: bool) -> Result<()> {
         let Some((first, rest)) = definition.tabs.split_first() else {
             return Err(format!("definition {:?} has no tabs", definition.label).into());
         };
@@ -338,7 +338,9 @@ impl Herdr {
             .position(|tab| tab.active)
             .unwrap_or(0);
         self.focus_tab(&restored_tab_ids[active]).map_err(hint)?;
-        self.focus(&created.workspace.workspace_id).map_err(hint)?;
+        if focus {
+            self.focus(&created.workspace.workspace_id).map_err(hint)?;
+        }
         Ok(())
     }
 }
@@ -400,23 +402,76 @@ fn close_current(herdr: &Herdr, config: &Path) -> Result<()> {
         .find(|workspace| workspace.id == pane.workspace_id)
         .ok_or_else(|| format!("current workspace {} was not found", pane.workspace_id))?;
 
-    ensure_saved(herdr, config, workspace)?;
-    herdr.close(&workspace.id)?;
-    println!("closed {}", workspace.label);
-    Ok(())
+    match resolve_close(herdr, config, workspace)? {
+        CloseDecision::Proceed => {
+            herdr.close(&workspace.id)?;
+            println!("closed {}", workspace.label);
+            Ok(())
+        }
+        CloseDecision::Cancelled => Err("close cancelled".into()),
+    }
 }
 
-fn ensure_saved(herdr: &Herdr, config: &Path, workspace: &Workspace) -> Result<()> {
-    if find_definition(config, &workspace.label)?.is_some() {
-        return Ok(());
+enum CloseDecision {
+    Proceed,
+    Cancelled,
+}
+
+/// close してよいかを決める。未保存なら保存・破棄・中止の三択。保存済みなら
+/// 現在の layout と比較し、一致した場合だけ無質問で通す (TOML の存在だけで
+/// 通すと、保存後に変わった構成を黙って失う)。snapshot は保存・比較に実際に
+/// 必要になるまで取らないので、検査不能な workspace も破棄では閉じられる。
+fn resolve_close(herdr: &Herdr, config: &Path, workspace: &Workspace) -> Result<CloseDecision> {
+    let label = &workspace.label;
+    let Some(saved) = find_definition(config, label)? else {
+        return Ok(
+            match choose(
+                &format!(
+                    "Workspace {label:?} is not saved. [s]ave and close / [d]iscard and close / [c]ancel "
+                ),
+                &['s', 'd'],
+            )? {
+                Some('s') => {
+                    save_definition(config, &snapshot_definition(herdr, workspace)?)?;
+                    CloseDecision::Proceed
+                }
+                Some('d') => CloseDecision::Proceed,
+                _ => CloseDecision::Cancelled,
+            },
+        );
+    };
+    match snapshot_definition(herdr, workspace) {
+        Ok(current) => {
+            // pane_id は skip_serializing なので、直列化形の比較で自動的に除外される
+            if toml::to_string_pretty(&saved)? == toml::to_string_pretty(&current)? {
+                return Ok(CloseDecision::Proceed);
+            }
+            Ok(
+                match choose(
+                    &format!(
+                        "Workspace {label:?} differs from its saved definition. [u]pdate and close / [d]iscard changes and close / [c]ancel "
+                    ),
+                    &['u', 'd'],
+                )? {
+                    Some('u') => {
+                        save_definition(config, &current)?;
+                        CloseDecision::Proceed
+                    }
+                    Some('d') => CloseDecision::Proceed,
+                    _ => CloseDecision::Cancelled,
+                },
+            )
+        }
+        Err(error) => {
+            eprintln!("pen: cannot compare workspace {label:?} with its saved definition: {error}");
+            Ok(
+                match choose("[d]iscard changes and close / [c]ancel ", &['d'])? {
+                    Some('d') => CloseDecision::Proceed,
+                    _ => CloseDecision::Cancelled,
+                },
+            )
+        }
     }
-    if !confirm(&format!(
-        "Save workspace {:?} before closing? [y/N] ",
-        workspace.label
-    ))? {
-        return Err("close cancelled; workspace has no saved definition".into());
-    }
-    save_definition(config, &snapshot_definition(herdr, workspace)?)
 }
 
 /// workspace の全 tab を export し、pane ごとの前景コマンドを添えた定義を作る。
@@ -487,76 +542,104 @@ fn capture_commands(herdr: &Herdr, node: &mut LayoutNode) -> Result<()> {
     Ok(())
 }
 
+/// Space は一覧を出し直して連続トグル、Enter はトグルして終了、Esc は終了。
+/// picker は popup として動き pen の exit で popup ごと閉じるため、「一覧を
+/// 維持」は fzf を pen 内の loop で起動し直すことで実現する (トグルごとに
+/// query とカーソル位置はリセットされる)。
 fn picker(herdr: &Herdr, config: &Path) -> Result<()> {
-    let definitions = load_definitions(config)?;
-    let workspaces = herdr.workspaces()?;
-    let mut rows = BTreeMap::<String, bool>::new();
-    for label in definitions.keys() {
-        rows.insert(label.clone(), false);
-    }
-    for workspace in &workspaces {
-        rows.insert(workspace.label.clone(), true);
-    }
-    if rows.is_empty() {
-        return Err("no saved or running workspaces".into());
-    }
+    let mut first = true;
+    loop {
+        let definitions = load_definitions(config)?;
+        let workspaces = herdr.workspaces()?;
+        let mut rows = BTreeMap::<String, bool>::new();
+        for label in definitions.keys() {
+            rows.insert(label.clone(), false);
+        }
+        for workspace in &workspaces {
+            rows.insert(workspace.label.clone(), true);
+        }
+        if rows.is_empty() {
+            if first {
+                return Err("no saved or running workspaces".into());
+            }
+            return Ok(());
+        }
+        first = false;
 
-    let input = rows
-        .iter()
-        .map(|(label, active)| format!("{}\t{label}", if *active { "●" } else { "○" }))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let fzf = env::var_os("PEN_FZF").unwrap_or_else(|| "fzf".into());
-    let mut child = Command::new(fzf)
-        .args([
-            "--ansi",
-            "--no-sort",
-            "--prompt=pen> ",
-            "--expect=enter,space,esc",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("cannot start fzf: {error}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = writeln!(stdin, "{input}");
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Ok(());
-    }
-    let text = String::from_utf8(output.stdout)?;
-    let mut lines = text.lines();
-    let key = lines.next().unwrap_or_default();
-    let row = lines.next().unwrap_or_default();
-    let label = row
-        .split_once('\t')
-        .map(|(_, label)| label)
-        .filter(|label| !label.is_empty());
-    let Some(label) = label else {
-        return Ok(());
-    };
-    let active = workspaces.iter().find(|workspace| workspace.label == label);
+        let input = rows
+            .iter()
+            .map(|(label, active)| format!("{}\t{label}", if *active { "●" } else { "○" }))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let fzf = env::var_os("PEN_FZF").unwrap_or_else(|| "fzf".into());
+        let mut child = Command::new(fzf)
+            .args([
+                "--ansi",
+                "--no-sort",
+                "--prompt=pen> ",
+                "--expect=enter,space,esc",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("cannot start fzf: {error}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = writeln!(stdin, "{input}");
+        }
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Ok(());
+        }
+        let text = String::from_utf8(output.stdout)?;
+        let mut lines = text.lines();
+        let key = lines.next().unwrap_or_default();
+        let row = lines.next().unwrap_or_default();
+        let label = row
+            .split_once('\t')
+            .map(|(_, label)| label)
+            .filter(|label| !label.is_empty());
+        let Some(label) = label else {
+            return Ok(());
+        };
+        let running = workspaces.iter().find(|workspace| workspace.label == label);
 
-    match (key, active) {
-        ("space", Some(workspace)) => {
-            ensure_saved(herdr, config, workspace)?;
-            herdr.close(&workspace.id)?;
-            println!("closed {label}");
+        match (key, running) {
+            ("space", Some(workspace)) => {
+                if let CloseDecision::Proceed = resolve_close(herdr, config, workspace)? {
+                    herdr.close(&workspace.id)?;
+                    println!("closed {label}");
+                }
+            }
+            // Space の復元は focus を奪わない — 一覧での連続操作を妨げないため
+            ("space", None) => {
+                herdr.restore(saved_definition(&definitions, label)?, false)?;
+                println!("restored {label}");
+            }
+            ("enter", Some(workspace)) => match resolve_close(herdr, config, workspace)? {
+                CloseDecision::Proceed => {
+                    herdr.close(&workspace.id)?;
+                    println!("closed {label}");
+                    return Ok(());
+                }
+                CloseDecision::Cancelled => {}
+            },
+            ("enter", None) => {
+                herdr.restore(saved_definition(&definitions, label)?, true)?;
+                println!("restored {label}");
+                return Ok(());
+            }
+            _ => return Ok(()),
         }
-        ("space" | "enter", None) => {
-            let definition = definitions
-                .get(label)
-                .ok_or_else(|| format!("saved definition not found: {label}"))?;
-            herdr.restore(definition)?;
-            println!("restored {label}");
-        }
-        ("enter", Some(workspace)) => {
-            herdr.focus(&workspace.id)?;
-        }
-        _ => {}
     }
-    Ok(())
+}
+
+fn saved_definition<'a>(
+    definitions: &'a BTreeMap<String, Definition>,
+    label: &str,
+) -> Result<&'a Definition> {
+    definitions
+        .get(label)
+        .ok_or_else(|| format!("saved definition not found: {label}").into())
 }
 
 fn save_definition(config: &Path, definition: &Definition) -> Result<()> {
@@ -605,15 +688,23 @@ fn safe_filename(label: &str) -> String {
     }
 }
 
-fn confirm(prompt: &str) -> Result<bool> {
+fn choose(prompt: &str, accepted: &[char]) -> Result<Option<char>> {
     eprint!("{prompt}");
     std::io::stderr().flush()?;
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
+    Ok(parse_choice(&answer, accepted))
+}
+
+/// 1文字選択の解釈。受理リスト外・複数文字・空入力・EOF はすべて None (= 中止)
+/// に倒す。close は破壊操作なので、曖昧な入力を実行側に解釈しない。
+fn parse_choice(answer: &str, accepted: &[char]) -> Option<char> {
+    let answer = answer.trim().to_ascii_lowercase();
+    let mut characters = answer.chars();
+    match (characters.next(), characters.next()) {
+        (Some(choice), None) if accepted.contains(&choice) => Some(choice),
+        _ => None,
+    }
 }
 
 fn config_dir() -> Result<PathBuf> {
@@ -631,12 +722,24 @@ fn home_dir() -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ForegroundProcess, ProcessInfo, command_from_process_info, safe_filename};
+    use super::{
+        ForegroundProcess, ProcessInfo, command_from_process_info, parse_choice, safe_filename,
+    };
 
     #[test]
     fn unsafe_label_characters_are_normalized() {
         assert_eq!(safe_filename("demo/project:*?"), "demo_project___");
         assert_eq!(safe_filename("..."), "workspace");
+    }
+
+    #[test]
+    fn only_a_single_known_character_selects_a_close_choice() {
+        assert_eq!(parse_choice("d\n", &['s', 'd']), Some('d'));
+        assert_eq!(parse_choice(" S \n", &['s', 'd']), Some('s'));
+        // 空入力・EOF・未知の文字・複数文字は中止に倒す
+        assert_eq!(parse_choice("", &['s', 'd']), None);
+        assert_eq!(parse_choice("x\n", &['s', 'd']), None);
+        assert_eq!(parse_choice("save\n", &['s', 'd']), None);
     }
 
     fn info(shell_pid: u64, leader: u64, processes: &[(u64, &[&str])]) -> ProcessInfo {
