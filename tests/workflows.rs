@@ -30,7 +30,16 @@ fn a_version_tag_builds_and_publishes_the_pen_release_assets() {
             "release workflow is missing {required}"
         );
     }
-    assert!(!source.contains("workflow_dispatch"));
+}
+
+#[test]
+fn release_builds_can_be_dispatched_without_publishing_a_release() {
+    let (source, _) = workflow(".github/workflows/release.yml");
+
+    assert!(source.contains("on:\n  workflow_dispatch:\n  push:"));
+    assert!(
+        source.contains("if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')")
+    );
 }
 
 #[test]
