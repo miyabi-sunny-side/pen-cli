@@ -415,7 +415,7 @@ fn close_keeps_the_saved_definition_and_closes_the_current_workspace() {
     assert_eq!(seen[5]["params"]["workspace_id"], "w2");
 }
 
-/// 三択 prompt へ1行流し込んで pen close を実行する
+/// 三択 prompt へ1キー流し込んで pen close を実行する
 fn close_with_answer(temp: &TempDir, socket: &Path, answer: &str) -> std::process::Output {
     let mut child = pen(temp, socket)
         .arg("close")
@@ -450,7 +450,7 @@ fn close_discard_closes_an_unsaved_workspace_without_saving() {
         ],
     );
 
-    let output = close_with_answer(&temp, &socket, "d\n");
+    let output = close_with_answer(&temp, &socket, "d");
     server.join().unwrap();
 
     assert!(
@@ -460,8 +460,10 @@ fn close_discard_closes_an_unsaved_workspace_without_saving() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("[s]ave") && stderr.contains("[d]iscard") && stderr.contains("[C]ancel"),
-        "stderr should offer the three close choices: {stderr}"
+        stderr.contains(
+            "Workspace \"scratch\" is not saved.\n[s]ave and close\n[d]iscard and close\n[C]ancel\n> "
+        ),
+        "stderr should present the close choices vertically: {stderr}"
     );
     // discard は snapshot 系 RPC を一切呼ばず、TOML も作らない
     let methods: Vec<_> = requests
@@ -475,6 +477,39 @@ fn close_discard_closes_an_unsaved_workspace_without_saving() {
         ["pane.current", "workspace.list", "workspace.close"]
     );
     assert!(!temp.0.join("config").exists());
+}
+
+#[test]
+fn close_rejects_a_multi_character_discard_answer() {
+    let temp = TempDir::new("close-ambiguous-discard");
+    let socket = temp.0.join("herdr.sock");
+    let (requests, server) = mock_herdr(
+        &socket,
+        vec![
+            reply(
+                r#"{"type":"pane_current","pane":{"pane_id":"w2:p1","workspace_id":"w2","tab_id":"w2:t1"}}"#,
+            ),
+            reply(
+                r#"{"type":"workspace_list","workspaces":[{"workspace_id":"w2","active_tab_id":"w2:t1","label":"scratch","focused":true}]}"#,
+            ),
+        ],
+    );
+
+    let output = close_with_answer(&temp, &socket, "discard\n");
+    server.join().unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("close cancelled"),
+        "an ambiguous answer should cancel the close"
+    );
+    let methods: Vec<_> = requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|request| request["method"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(methods, ["pane.current", "workspace.list"]);
 }
 
 #[test]
@@ -509,7 +544,7 @@ fn close_asks_when_the_workspace_differs_from_its_saved_definition() {
         ],
     );
 
-    let output = close_with_answer(&temp, &socket, "d\n");
+    let output = close_with_answer(&temp, &socket, "d");
     server.join().unwrap();
 
     assert!(
@@ -519,8 +554,10 @@ fn close_asks_when_the_workspace_differs_from_its_saved_definition() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("differs") && stderr.contains("[u]pdate") && stderr.contains("[C]ancel"),
-        "stderr should ask about the mismatch: {stderr}"
+        stderr.contains(
+            "Workspace \"demo\" differs from its saved definition.\n[u]pdate and close\n[d]iscard changes and close\n[C]ancel\n> "
+        ),
+        "stderr should present the mismatch choices vertically: {stderr}"
     );
     assert_eq!(
         fs::read_to_string(config.join("demo.toml")).unwrap(),

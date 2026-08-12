@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, IsTerminal, Write};
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -427,7 +428,7 @@ fn resolve_close(herdr: &Herdr, config: &Path, workspace: &Workspace) -> Result<
         return Ok(
             match choose(
                 &format!(
-                    "Workspace {label:?} is not saved. [s]ave and close / [d]iscard and close / [C]ancel "
+                    "Workspace {label:?} is not saved.\n[s]ave and close\n[d]iscard and close\n[C]ancel\n> "
                 ),
                 &['s', 'd'],
             )? {
@@ -449,7 +450,7 @@ fn resolve_close(herdr: &Herdr, config: &Path, workspace: &Workspace) -> Result<
             Ok(
                 match choose(
                     &format!(
-                        "Workspace {label:?} differs from its saved definition. [u]pdate and close / [d]iscard changes and close / [C]ancel "
+                        "Workspace {label:?} differs from its saved definition.\n[u]pdate and close\n[d]iscard changes and close\n[C]ancel\n> "
                     ),
                     &['u', 'd'],
                 )? {
@@ -465,7 +466,7 @@ fn resolve_close(herdr: &Herdr, config: &Path, workspace: &Workspace) -> Result<
         Err(error) => {
             eprintln!("pen: cannot compare workspace {label:?} with its saved definition: {error}");
             Ok(
-                match choose("[d]iscard changes and close / [C]ancel ", &['d'])? {
+                match choose("[d]iscard changes and close\n[C]ancel\n> ", &['d'])? {
                     Some('d') => CloseDecision::Proceed,
                     _ => CloseDecision::Cancelled,
                 },
@@ -689,9 +690,91 @@ fn safe_filename(label: &str) -> String {
 fn choose(prompt: &str, accepted: &[char]) -> Result<Option<char>> {
     eprint!("{prompt}");
     std::io::stderr().flush()?;
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let terminal_fd = input.is_terminal().then(|| input.as_raw_fd());
+    let choice = read_choice(&mut input, terminal_fd, accepted)?;
+    if terminal_fd.is_some() {
+        match choice {
+            Some(choice) => eprintln!("{choice}"),
+            None => eprintln!(),
+        }
+    }
+    Ok(choice)
+}
+
+fn read_choice<R: BufRead>(
+    input: &mut R,
+    terminal_fd: Option<RawFd>,
+    accepted: &[char],
+) -> Result<Option<char>> {
+    if let Some(terminal_fd) = terminal_fd {
+        let mut terminal = ImmediateInput::new(terminal_fd)?;
+        let mut answer = [0];
+        let read = input.read(&mut answer)?;
+        terminal.restore()?;
+        return Ok(parse_choice(
+            std::str::from_utf8(&answer[..read]).unwrap_or_default(),
+            accepted,
+        ));
+    }
     let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
+    input.read_line(&mut answer)?;
     Ok(parse_choice(&answer, accepted))
+}
+
+struct ImmediateInput {
+    fd: RawFd,
+    original: libc::termios,
+    restored: bool,
+}
+
+impl ImmediateInput {
+    fn new(fd: RawFd) -> std::io::Result<Self> {
+        let mut original = std::mem::MaybeUninit::uninit();
+        // SAFETY: `fd` is a live terminal descriptor and `original` points to
+        // writable storage for one termios value.
+        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: tcgetattr succeeded and initialized the value.
+        let original = unsafe { original.assume_init() };
+        let mut immediate = original;
+        immediate.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+        immediate.c_cc[libc::VMIN] = 1;
+        immediate.c_cc[libc::VTIME] = 0;
+        // SAFETY: `fd` remains live and `immediate` is a valid termios value
+        // derived from the terminal's current settings.
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw const immediate) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            fd,
+            original,
+            restored: false,
+        })
+    }
+
+    fn restore(&mut self) -> std::io::Result<()> {
+        // SAFETY: the guard cannot outlive the input handle in `read_choice`,
+        // so `fd` is live while restoring its captured settings.
+        if unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &raw const self.original) } == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.restored = true;
+        Ok(())
+    }
+}
+
+impl Drop for ImmediateInput {
+    fn drop(&mut self) {
+        if !self.restored {
+            // Best effort on early returns. The explicit path reports errors.
+            unsafe {
+                libc::tcsetattr(self.fd, libc::TCSANOW, &raw const self.original);
+            }
+        }
+    }
 }
 
 /// 1文字選択の解釈。受理リスト外・複数文字・空入力・EOF はすべて None (= 中止)
@@ -721,8 +804,14 @@ fn home_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ForegroundProcess, ProcessInfo, command_from_process_info, parse_choice, safe_filename,
+        ForegroundProcess, ProcessInfo, command_from_process_info, parse_choice, read_choice,
+        safe_filename,
     };
+    use std::fs::File;
+    use std::io::Write as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     #[test]
     fn unsafe_label_characters_are_normalized() {
@@ -736,10 +825,91 @@ mod tests {
         assert_eq!(parse_choice(" S \n", &['s', 'd']), Some('s'));
         // 空入力・EOF・未知の文字・複数文字は中止に倒す
         assert_eq!(parse_choice("", &['s', 'd']), None);
+        assert_eq!(parse_choice("\n", &['s', 'd']), None);
+        assert_eq!(parse_choice("\u{1b}", &['s', 'd']), None);
         assert_eq!(parse_choice("x\n", &['s', 'd']), None);
         assert_eq!(parse_choice("save\n", &['s', 'd']), None);
         // 明示の C も default と同じ中止 (受理リストに含めないことで成立)
         assert_eq!(parse_choice("C\n", &['s', 'd']), None);
+    }
+
+    #[test]
+    fn terminal_choices_complete_without_enter_and_restore_the_terminal() {
+        assert_terminal_choice(b'd', Some('d'));
+        assert_terminal_choice(b'C', None);
+        assert_terminal_choice(b'\n', None);
+        assert_terminal_choice(0x1b, None);
+        assert_terminal_choice(0x03, None);
+    }
+
+    fn assert_terminal_choice(key: u8, expected: Option<char>) {
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        // SAFETY: openpty initializes both descriptors; no optional name or
+        // terminal attributes are requested.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &raw mut master_fd,
+                    &raw mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        // SAFETY: ownership of each descriptor returned by openpty is moved
+        // into exactly one File.
+        let mut master = unsafe { File::from_raw_fd(master_fd) };
+        let slave = unsafe { File::from_raw_fd(slave_fd) };
+        let original = terminal_settings(slave.as_raw_fd());
+        // SAFETY: dup creates an independently owned descriptor for checking
+        // the settings after the reader thread closes its handle.
+        let monitor_fd = unsafe { libc::dup(slave.as_raw_fd()) };
+        assert_ne!(monitor_fd, -1);
+        let monitor = unsafe { File::from_raw_fd(monitor_fd) };
+        let (sender, receiver) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let slave_fd = slave.as_raw_fd();
+            let mut slave = std::io::BufReader::new(slave);
+            let result =
+                read_choice(&mut slave, Some(slave_fd), &['d']).map_err(|error| error.to_string());
+            sender.send(result).unwrap();
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while terminal_settings(monitor.as_raw_fd()).c_lflag
+            & (libc::ICANON | libc::ECHO | libc::ISIG)
+            != 0
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminal did not enter immediate input mode"
+            );
+            std::thread::yield_now();
+        }
+        master.write_all(&[key]).unwrap();
+        let result = receiver.recv_timeout(Duration::from_secs(1));
+        if result.is_err() {
+            // Unblock a canonical implementation so the test can fail cleanly.
+            master.write_all(b"\n").unwrap();
+        }
+        assert_eq!(result.unwrap().unwrap(), expected);
+        handle.join().unwrap();
+
+        let restored = terminal_settings(monitor.as_raw_fd());
+        assert_eq!(restored.c_lflag, original.c_lflag);
+        assert_eq!(restored.c_cc[libc::VMIN], original.c_cc[libc::VMIN]);
+        assert_eq!(restored.c_cc[libc::VTIME], original.c_cc[libc::VTIME]);
+    }
+
+    fn terminal_settings(fd: std::os::fd::RawFd) -> libc::termios {
+        let mut settings = std::mem::MaybeUninit::uninit();
+        // SAFETY: `fd` is a live PTY descriptor and settings is writable.
+        assert_eq!(unsafe { libc::tcgetattr(fd, settings.as_mut_ptr()) }, 0);
+        // SAFETY: the successful tcgetattr initialized settings.
+        unsafe { settings.assume_init() }
     }
 
     fn info(shell_pid: u64, leader: u64, processes: &[(u64, &[&str])]) -> ProcessInfo {
