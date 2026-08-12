@@ -899,7 +899,12 @@ mod tests {
         handle.join().unwrap();
 
         let restored = terminal_settings(monitor.as_raw_fd());
-        assert_eq!(restored.c_lflag, original.c_lflag);
+        // Darwin sets PENDIN when ICANON is restored so queued input can be
+        // reprocessed. It is transient kernel state, not a setting to restore.
+        assert_eq!(
+            restored.c_lflag & !libc::PENDIN,
+            original.c_lflag & !libc::PENDIN
+        );
         assert_eq!(restored.c_cc[libc::VMIN], original.c_cc[libc::VMIN]);
         assert_eq!(restored.c_cc[libc::VTIME], original.c_cc[libc::VTIME]);
     }
