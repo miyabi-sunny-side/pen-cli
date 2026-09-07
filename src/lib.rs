@@ -227,7 +227,7 @@ impl Herdr {
         Ok(serde_json::from_value(result)?)
     }
 
-    fn current_pane(&self) -> Result<PaneInfo> {
+    fn current_workspace(&self) -> Result<Workspace> {
         // pane.current は caller_pane_id がないと「focus 中の pane」に解決される。
         // herdr が pane の shell に配る HERDR_PANE_ID を渡し、focus がどこに
         // あっても呼び出し元自身の workspace を対象にする。
@@ -235,9 +235,13 @@ impl Herdr {
             Ok(pane_id) => json!({ "caller_pane_id": pane_id }),
             Err(_) => json!({}),
         };
-        Ok(self
+        let pane = self
             .call::<PaneCurrentResult>("pane.current", &params)?
-            .pane)
+            .pane;
+        self.workspaces()?
+            .into_iter()
+            .find(|workspace| workspace.id == pane.workspace_id)
+            .ok_or_else(|| format!("current workspace {} was not found", pane.workspace_id).into())
     }
 
     fn workspaces(&self) -> Result<Vec<Workspace>> {
@@ -379,13 +383,8 @@ where
 }
 
 fn save_current(herdr: &Herdr, config: &Path) -> Result<()> {
-    let pane = herdr.current_pane()?;
-    let workspaces = herdr.workspaces()?;
-    let workspace = workspaces
-        .iter()
-        .find(|workspace| workspace.id == pane.workspace_id)
-        .ok_or_else(|| format!("current workspace {} was not found", pane.workspace_id))?;
-    save_definition(config, &snapshot_definition(herdr, workspace)?)?;
+    let workspace = herdr.current_workspace()?;
+    save_definition(config, &snapshot_definition(herdr, &workspace)?)?;
     // 保存は完了している。toast は通知でしかないので失敗しても save を汚さない
     if let Err(error) = herdr.notify(&format!("セッション {} を保存しました", workspace.label))
     {
@@ -396,14 +395,9 @@ fn save_current(herdr: &Herdr, config: &Path) -> Result<()> {
 }
 
 fn close_current(herdr: &Herdr, config: &Path) -> Result<()> {
-    let pane = herdr.current_pane()?;
-    let workspaces = herdr.workspaces()?;
-    let workspace = workspaces
-        .iter()
-        .find(|workspace| workspace.id == pane.workspace_id)
-        .ok_or_else(|| format!("current workspace {} was not found", pane.workspace_id))?;
+    let workspace = herdr.current_workspace()?;
 
-    match resolve_close(herdr, config, workspace)? {
+    match resolve_close(herdr, config, &workspace)? {
         CloseDecision::Proceed => {
             herdr.close(&workspace.id)?;
             println!("closed {}", workspace.label);
@@ -612,20 +606,19 @@ fn picker(herdr: &Herdr, config: &Path) -> Result<()> {
                     println!("closed {label}");
                 }
             }
-            // Space の復元は focus を奪わない — 一覧での連続操作を妨げないため
-            ("space", None) => {
-                herdr.restore(saved_definition(&definitions, label)?, false)?;
-                println!("restored {label}");
-            }
             // Enter は決定キー: 稼働中の workspace へは移動するだけで閉じない
             ("enter", Some(workspace)) => {
                 herdr.focus(&workspace.id)?;
                 return Ok(());
             }
-            ("enter", None) => {
-                herdr.restore(saved_definition(&definitions, label)?, true)?;
+            // Enter は focus して終了、Space は focus を奪わず一覧を続ける
+            ("enter" | "space", None) => {
+                let focus = key == "enter";
+                herdr.restore(saved_definition(&definitions, label)?, focus)?;
                 println!("restored {label}");
-                return Ok(());
+                if focus {
+                    return Ok(());
+                }
             }
             _ => return Ok(()),
         }

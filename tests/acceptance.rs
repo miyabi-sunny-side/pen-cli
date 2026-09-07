@@ -118,6 +118,39 @@ fn pen(temp: &TempDir, socket: &Path) -> Command {
 }
 
 #[test]
+fn save_and_close_fail_before_mutation_when_the_current_workspace_is_missing() {
+    for command in ["save", "close"] {
+        let temp = TempDir::new("missing-workspace");
+        let socket = temp.0.join("herdr.sock");
+        let (requests, server) = mock_herdr(
+            &socket,
+            vec![
+                reply(r#"{"pane":{"workspace_id":"w7"}}"#),
+                reply(
+                    r#"{"workspaces":[{"workspace_id":"w8","active_tab_id":"w8:t1","label":"other"}]}"#,
+                ),
+            ],
+        );
+        let output = pen(&temp, &socket).arg(command).output().unwrap();
+        server.join().unwrap();
+
+        assert_eq!(output.status.code(), Some(1), "{command}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "pen: current workspace w7 was not found\n",
+            "{command}"
+        );
+        assert!(output.stdout.is_empty());
+        assert!(!temp.0.join("config").exists());
+        let seen = requests.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0]["method"], "pane.current");
+        assert_eq!(seen[0]["params"]["caller_pane_id"], "w7:p1");
+        assert_eq!(seen[1]["method"], "workspace.list");
+    }
+}
+
+#[test]
 fn save_persists_every_tab_with_foreground_commands_as_toml() {
     let temp = TempDir::new("save");
     let socket = temp.0.join("herdr.sock");
