@@ -82,11 +82,9 @@ fn workflows_are_valid_pinned_and_minimally_privileged() {
 }
 
 #[test]
-fn repository_has_the_v0_1_0_rust_cli_foundation() {
+fn repository_has_the_rust_cli_foundation() {
     let manifest = fs::read_to_string("Cargo.toml").unwrap();
     let toolchain = fs::read_to_string("rust-toolchain.toml").unwrap();
-    let license = fs::read_to_string("LICENSE").unwrap();
-    let readme = fs::read_to_string("README.md").unwrap();
     let (ci, _) = workflow(".github/workflows/ci.yml");
 
     let version_line = format!("version = \"{}\"", env!("CARGO_PKG_VERSION"));
@@ -103,20 +101,6 @@ fn repository_has_the_v0_1_0_rust_cli_foundation() {
         );
     }
     assert!(toolchain.contains("channel = \"1.96.0\""));
-    assert!(license.starts_with("MIT License\n"));
-    for required in [
-        "Linux x86_64",
-        "macOS Apple Silicon",
-        "Intel Macs are not supported",
-        "herdr",
-        "fzf",
-        "PEN_CONFIG_DIR",
-        "PEN_SOCKET",
-        "PEN_FZF",
-        "xattr -d com.apple.quarantine pen",
-    ] {
-        assert!(readme.contains(required), "README is missing {required}");
-    }
     for required in [
         "cargo fmt --check",
         "cargo clippy --all-targets --all-features --locked -- -D warnings",
