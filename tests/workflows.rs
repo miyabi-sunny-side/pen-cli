@@ -2,8 +2,8 @@ use serde_yaml::Value;
 use std::{fs, path::Path};
 
 fn workflow(path: &str) -> (String, Value) {
-    let source = fs::read_to_string(path).unwrap();
-    let yaml = serde_yaml::from_str(&source).unwrap();
+    let source = fs::read_to_string(path).expect("workflow file is readable from the crate root");
+    let yaml = serde_yaml::from_str(&source).expect("workflow file is valid YAML");
     (source, yaml)
 }
 
@@ -43,11 +43,16 @@ fn release_builds_can_be_dispatched_without_publishing_a_release() {
 }
 
 #[test]
-fn ci_runs_for_main_pull_requests_but_not_pushes() {
-    let (source, _) = workflow(".github/workflows/ci.yml");
+fn ci_runs_for_main_pushes_and_pull_requests() {
+    let (_, ci) = workflow(".github/workflows/ci.yml");
 
-    assert!(source.contains("on:\n  pull_request:\n    branches:\n      - main"));
-    assert!(!source.contains("\n  push:"));
+    for event in ["push", "pull_request"] {
+        assert_eq!(
+            ci["on"][event]["branches"],
+            serde_yaml::from_str::<Value>("[main]").expect("literal is valid YAML"),
+            "CI must run on {event} to main"
+        );
+    }
 }
 
 #[test]

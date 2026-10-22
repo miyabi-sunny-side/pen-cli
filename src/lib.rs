@@ -763,6 +763,8 @@ impl Drop for ImmediateInput {
     fn drop(&mut self) {
         if !self.restored {
             // Best effort on early returns. The explicit path reports errors.
+            // SAFETY: the guard cannot outlive the input handle in `read_choice`,
+            // so `fd` is live while restoring its captured settings.
             unsafe {
                 libc::tcsetattr(self.fd, libc::TCSANOW, &raw const self.original);
             }
@@ -838,9 +840,9 @@ mod tests {
     fn assert_terminal_choice(key: u8, expected: Option<char>) {
         let mut master_fd = -1;
         let mut slave_fd = -1;
-        // SAFETY: openpty initializes both descriptors; no optional name or
-        // terminal attributes are requested.
         assert_eq!(
+            // SAFETY: openpty initializes both descriptors; no optional name or
+            // terminal attributes are requested.
             unsafe {
                 libc::openpty(
                     &raw mut master_fd,
@@ -855,12 +857,16 @@ mod tests {
         // SAFETY: ownership of each descriptor returned by openpty is moved
         // into exactly one File.
         let mut master = unsafe { File::from_raw_fd(master_fd) };
+        // SAFETY: openpty returned `slave_fd` as a new descriptor, moved into
+        // exactly this one File.
         let slave = unsafe { File::from_raw_fd(slave_fd) };
         let original = terminal_settings(slave.as_raw_fd());
         // SAFETY: dup creates an independently owned descriptor for checking
         // the settings after the reader thread closes its handle.
         let monitor_fd = unsafe { libc::dup(slave.as_raw_fd()) };
         assert_ne!(monitor_fd, -1);
+        // SAFETY: dup succeeded, so `monitor_fd` is a fresh descriptor owned
+        // only by this File.
         let monitor = unsafe { File::from_raw_fd(monitor_fd) };
         let (sender, receiver) = mpsc::channel();
         let handle = std::thread::spawn(move || {

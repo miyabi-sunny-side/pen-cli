@@ -71,8 +71,11 @@ fn mock_herdr(
     socket: &Path,
     replies: Vec<String>,
 ) -> (Arc<Mutex<Vec<serde_json::Value>>>, thread::JoinHandle<()>) {
-    let listener = UnixListener::bind(socket).unwrap();
-    listener.set_nonblocking(true).unwrap();
+    let listener =
+        UnixListener::bind(socket).expect("mock herdr socket path is free in a fresh TempDir");
+    listener
+        .set_nonblocking(true)
+        .expect("a bound listener accepts non-blocking mode");
     let requests = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&requests);
     let handle = thread::spawn(move || {
@@ -93,15 +96,21 @@ fn mock_herdr(
             // macOS (BSD) では accept した stream が listener の non-blocking を
             // 継承する。client の書き込み前に read すると EAGAIN で落ちるため、
             // blocking へ戻して要求の到着を待つ (Linux は元々 blocking)
-            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_nonblocking(false)
+                .expect("an accepted stream accepts blocking mode");
             let mut line = String::new();
-            BufReader::new(stream.try_clone().unwrap())
-                .read_line(&mut line)
-                .unwrap();
+            BufReader::new(
+                stream
+                    .try_clone()
+                    .expect("an accepted stream can be cloned"),
+            )
+            .read_line(&mut line)
+            .expect("pen sends one request line per connection");
             seen.lock()
-                .unwrap()
-                .push(serde_json::from_str(line.trim()).unwrap());
-            writeln!(stream, "{response}").unwrap();
+                .expect("no other holder of the request log panicked")
+                .push(serde_json::from_str(line.trim()).expect("pen sends a JSON request"));
+            writeln!(stream, "{response}").expect("pen waits for the mock reply");
         }
     });
     (requests, handle)
@@ -456,14 +465,16 @@ fn close_with_answer(temp: &TempDir, socket: &Path, answer: &str) -> std::proces
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .unwrap();
+        .expect("the pen binary built by cargo can be spawned");
     child
         .stdin
         .take()
-        .unwrap()
+        .expect("stdin was configured as piped")
         .write_all(answer.as_bytes())
-        .unwrap();
-    child.wait_with_output().unwrap()
+        .expect("pen reads the answer from stdin");
+    child
+        .wait_with_output()
+        .expect("pen exits and its output is collected")
 }
 
 #[test]
