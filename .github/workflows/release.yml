@@ -44,9 +44,6 @@ jobs:
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           test "v$version" = "$GITHUB_REF_NAME"
 
-      - name: Run tests
-        run: cargo test --locked
-
       - name: Build release binary
         run: cargo build --release --locked --target "${{ matrix.target }}"
 

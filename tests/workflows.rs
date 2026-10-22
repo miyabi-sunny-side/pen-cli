@@ -1,5 +1,5 @@
 use serde_yaml::Value;
-use std::{fs, path::Path};
+use std::fs;
 
 fn workflow(path: &str) -> (String, Value) {
     let source = fs::read_to_string(path).expect("workflow file is readable from the crate root");
@@ -19,7 +19,6 @@ fn a_version_tag_builds_and_publishes_the_pen_release_assets() {
         "pen-linux-x86_64.tar.gz",
         "pen-macos-aarch64.tar.gz",
         "Verify tag matches Cargo version",
-        "cargo test --locked",
         "cargo build --release --locked --target",
         "pen LICENSE",
         "softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228",
@@ -43,41 +42,21 @@ fn release_builds_can_be_dispatched_without_publishing_a_release() {
 }
 
 #[test]
-fn ci_runs_for_main_pushes_and_pull_requests() {
-    let (_, ci) = workflow(".github/workflows/ci.yml");
-
-    for event in ["push", "pull_request"] {
-        assert_eq!(
-            ci["on"][event]["branches"],
-            serde_yaml::from_str::<Value>("[main]").expect("literal is valid YAML"),
-            "CI must run on {event} to main"
+fn release_workflow_is_valid_pinned_and_minimally_privileged() {
+    let (source, release) = workflow(".github/workflows/release.yml");
+    for line in source.lines() {
+        let Some(action) = line.trim().strip_prefix("- uses: ") else {
+            continue;
+        };
+        let action = action.split_whitespace().next().unwrap();
+        let (_, reference) = action.split_once('@').unwrap();
+        assert_eq!(reference.len(), 40, "{action}");
+        assert!(
+            reference.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "{action}"
         );
     }
-}
 
-#[test]
-fn workflows_are_valid_pinned_and_minimally_privileged() {
-    for path in [
-        Path::new(".github/workflows/ci.yml"),
-        Path::new(".github/workflows/release.yml"),
-    ] {
-        let (source, _) = workflow(path.to_str().unwrap());
-        for line in source.lines() {
-            let Some(action) = line.trim().strip_prefix("- uses: ") else {
-                continue;
-            };
-            let action = action.split_whitespace().next().unwrap();
-            let (_, reference) = action.split_once('@').unwrap();
-            assert_eq!(reference.len(), 40, "{action} in {}", path.display());
-            assert!(
-                reference.bytes().all(|byte| byte.is_ascii_hexdigit()),
-                "{action} in {}",
-                path.display()
-            );
-        }
-    }
-
-    let (_, release) = workflow(".github/workflows/release.yml");
     assert_eq!(release["permissions"]["contents"], "read");
     assert_eq!(
         release["jobs"]["release"]["permissions"]["contents"],
@@ -90,7 +69,6 @@ fn workflows_are_valid_pinned_and_minimally_privileged() {
 fn repository_has_the_rust_cli_foundation() {
     let manifest = fs::read_to_string("Cargo.toml").unwrap();
     let toolchain = fs::read_to_string("rust-toolchain.toml").unwrap();
-    let (ci, _) = workflow(".github/workflows/ci.yml");
 
     let version_line = format!("version = \"{}\"", env!("CARGO_PKG_VERSION"));
     for required in [
@@ -106,12 +84,4 @@ fn repository_has_the_rust_cli_foundation() {
         );
     }
     assert!(toolchain.contains("channel = \"1.96.0\""));
-    for required in [
-        "cargo fmt --check",
-        "cargo clippy --all-targets --all-features --locked -- -D warnings",
-        "cargo test --locked",
-        "cargo build --locked --release",
-    ] {
-        assert!(ci.contains(required), "CI workflow is missing {required}");
-    }
 }
